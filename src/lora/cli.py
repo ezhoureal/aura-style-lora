@@ -230,10 +230,9 @@ def train(args: argparse.Namespace) -> int:
         )
         return 1
 
-    cache_dir = REPO_ROOT / ".cache"
-    cache_dir.mkdir(exist_ok=True)
-    diffusers_dir = ensure_diffusers_checkout(cache_dir, train_cfg["diffusers_ref"])
-    script_path = diffusers_dir / "examples" / "dreambooth" / "train_dreambooth_lora_flux.py"
+    script_path = REPO_ROOT / train_cfg.get(
+        "training_script", "scripts/train_dreambooth_lora_flux_lowmem.py"
+    )
 
     command = [
         "accelerate",
@@ -263,7 +262,7 @@ def train(args: argparse.Namespace) -> int:
         "--max_train_steps": train_cfg["max_train_steps"],
         "--rank": train_cfg["rank"],
         "--lora_alpha": train_cfg["lora_alpha"],
-        "--validation_prompt": train_cfg["validation_prompt"],
+        "--validation_prompt": train_cfg.get("validation_prompt") or None,
         "--validation_epochs": train_cfg["validation_epochs"],
         "--num_validation_images": train_cfg["num_validation_images"],
         "--seed": train_cfg["seed"],

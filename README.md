@@ -2,7 +2,7 @@
 
 This repo is a minimal local workspace for preparing a custom image dataset, launching a `FLUX.1-dev` LoRA run, and testing the resulting adapter.
 
-It uses Hugging Face's official `diffusers` training script for Flux LoRA training, while keeping the project-specific logic here in this repo:
+It uses a tracked local copy of Hugging Face's `diffusers` Flux LoRA trainer, patched for lower memory use, while keeping the project-specific logic here in this repo:
 
 - dataset normalization into a local `imagefolder` dataset
 - prompt and caption templating
@@ -13,6 +13,7 @@ It uses Hugging Face's official `diffusers` training script for Flux LoRA traini
 
 - [configs/flux_lora.toml](/home/zireael/lora/configs/flux_lora.toml)
 - [src/lora/cli.py](/home/zireael/lora/src/lora/cli.py)
+- [scripts/train_dreambooth_lora_flux_lowmem.py](/home/zireael/lora/scripts/train_dreambooth_lora_flux_lowmem.py)
 - [dataset](/home/zireael/lora/dataset/)
 
 ## Why this setup
@@ -121,9 +122,9 @@ lora train
 
 The launcher will:
 
-- clone or update `diffusers` into `.cache/diffusers`
-- check out the configured ref
-- run `examples/dreambooth/train_dreambooth_lora_flux.py`
+- run the tracked `scripts/train_dreambooth_lora_flux_lowmem.py` trainer
+- precompute all caption embeddings with CLIP/T5 before loading the FLUX transformer onto the GPU
+- free CLIP/T5 before transformer LoRA training starts
 
 The default config is intentionally conservative for a small dataset:
 
@@ -132,6 +133,7 @@ The default config is intentionally conservative for a small dataset:
 - `adamw` with learning rate `1e-4`
 - gradient checkpointing on
 - latent caching on
+- in-training validation off, so the trainer does not reload the full inference pipeline while training
 
 ## 5. Test inference
 
@@ -157,6 +159,5 @@ samples/flux-lora-test.png
 
 - `FLUX.1-dev` is gated on Hugging Face, so you must accept the model terms before downloads work.
 - The official DreamBooth Flux trainer is text-to-image. It trains from the target image and `prompt` column; paired source images are preserved in `conditioning/` and referenced by metadata for future image-conditioned workflows, but this trainer does not consume them.
-- Flux LoRA training is memory-heavy. This workspace defaults to 512px, rank 8, gradient checkpointing, and latent caching to make first runs more practical.
+- Flux LoRA training is memory-heavy. This workspace defaults to 512px, rank 8, gradient checkpointing, latent caching, and cached prompt embeddings to fit a 32 GB GPU more reliably.
 - If your GPU still runs out of memory, reduce `resolution`, reduce `rank`, or increase `gradient_accumulation_steps`.
-
