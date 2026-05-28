@@ -1,0 +1,44 @@
+[dataset]
+source_dir = "dataset"
+prepared_dir = "training_data/flux_portrait_style"
+
+[prompts]
+paired_subject = "man"
+instance_prompt = "A strong colorful light is illuminating man's silhouette. Medium shot. The image is rendered in a smooth gradient of luminous light, giving a radiant and ethereal appearance. Subtle contour lighting highlights delicate outlines, adding depth and a refined, high-end cinematic glow"
+prompt_template = "A strong colorful light is illuminating {subject}'s silhouette. Medium shot. The image is rendered in a smooth gradient of luminous light, giving a radiant and ethereal appearance. Subtle contour lighting highlights delicate outlines, adding depth and a refined, high-end cinematic glow"
+
+[training]
+model_name = "black-forest-labs/FLUX.1-dev"
+diffusers_ref = "main"
+output_dir = "outputs/flux-lora-zrlprfl"
+mixed_precision = "bf16"
+resolution = 512
+train_batch_size = 1
+gradient_accumulation_steps = 4
+gradient_checkpointing = true
+optimizer = "adamw"
+learning_rate = 1e-4
+lr_scheduler = "constant"
+lr_warmup_steps = 0
+max_train_steps = 1000
+rank = 8
+lora_alpha = 8
+validation_prompt = "A strong colorful light is illuminating man's silhouette. Medium shot. The image is rendered in a smooth gradient of luminous light, giving a radiant and ethereal appearance. Subtle contour lighting highlights delicate outlines, adding depth and a refined, high-end cinematic glow"
+validation_epochs = 100
+num_validation_images = 2
+seed = 42
+report_to = "tensorboard"
+repeats = 10
+max_sequence_length = 256
+cache_latents = true
+use_8bit_adam = false
+push_to_hub = false
+
+[inference]
+weight_name = "pytorch_lora_weights.safetensors"
+prompt = "A strong colorful light is illuminating man's silhouette. Medium shot. The image is rendered in a smooth gradient of luminous light, giving a radiant and ethereal appearance. Subtle contour lighting highlights delicate outlines, adding depth and a refined, high-end cinematic glow"
+output_path = "samples/flux-lora-test.png"
+height = 1024
+width = 1024
+guidance_scale = 3.5
+num_inference_steps = 28
