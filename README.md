@@ -54,9 +54,9 @@ accelerate config default
 This will:
 
 - convert all supported images in `dataset/` to RGB PNGs
-- write target images into `training_data/flux_portrait_style/train/`
-- write paired source inputs into `training_data/flux_portrait_style/conditioning/`
-- create `training_data/flux_portrait_style/train/metadata.jsonl`
+- write target images into `training_data/flux_aura_style/train/`
+- write paired source inputs into `training_data/flux_aura_style/conditioning/`
+- create `training_data/flux_aura_style/train/metadata.jsonl`
 
 Run:
 
@@ -74,22 +74,22 @@ For numbered pairs, `{subject}` comes from `paired_subject` in [configs/flux_lor
 
 ## 3. Share or fetch the dataset
 
-Uploading the prepared dataset to Hugging Face is recommended if other users should reproduce the run. Upload `training_data/flux_portrait_style`, not the raw `dataset/` folder, unless you intentionally want to publish the original source images too.
+Uploading the prepared dataset to Hugging Face is recommended if other users should reproduce the run. Upload `training_data/flux_aura_style`, not the raw `dataset/` folder, unless you intentionally want to publish the original source images too.
 
 Before publishing, make sure every image is safe to redistribute and choose `--private` if the dataset should only be available to collaborators.
 
 ```bash
 hf auth login
-hf repo create ezhoureal/flux-portrait-style --type dataset --private
-hf upload ezhoureal/flux-portrait-style training_data/flux_portrait_style .
+hf repo create ezhoureal/flux-aura-style --type dataset --private
+hf upload ezhoureal/flux-aura-style training_data/flux_aura_style .
 ```
 
 Other users can fetch it with:
 
 ```bash
-hf download ezhoureal/flux-portrait-style \
+hf download ezhoureal/flux-aura-style \
   --repo-type dataset \
-  --local-dir training_data/flux_portrait_style
+  --local-dir training_data/flux_aura_style
 ```
 
 Then they can train without running `lora prepare-dataset`:
@@ -102,7 +102,7 @@ uv run lora train
 The prepared dataset must keep this layout:
 
 ```text
-training_data/flux_portrait_style/
+training_data/flux_aura_style/
   train/
     metadata.jsonl
     pair-001.png
