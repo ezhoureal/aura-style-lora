@@ -8,15 +8,23 @@ import shutil
 import subprocess
 import sys
 import textwrap
+import tomllib
 from dataclasses import dataclass
 from importlib.util import find_spec
 from pathlib import Path
-from typing import Any
-import tomllib
+from typing import Any, Protocol, cast
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG = REPO_ROOT / "configs" / "flux_lora.toml"
+
+
+class CommandFunc(Protocol):
+    def __call__(self, args: argparse.Namespace) -> int: ...
+
+
+class PipelineResult(Protocol):
+    images: list[Any]
 
 
 @dataclass
@@ -54,9 +62,7 @@ def convert_image(source: Path, target: Path) -> None:
 
 
 def prepare_dataset(args: argparse.Namespace) -> int:
-    try:
-        from PIL import Image, ImageOps
-    except ImportError:
+    if find_spec("PIL") is None:
         print("Pillow is required. Install project dependencies first.", file=sys.stderr)
         return 1
 
@@ -198,6 +204,7 @@ def train(args: argparse.Namespace) -> int:
             "datasets",
             "diffusers",
             "ftfy",
+            "hf_transfer",
             "peft",
             "sentencepiece",
             "tensorboard",
@@ -288,10 +295,13 @@ def train(args: argparse.Namespace) -> int:
 
 def infer(args: argparse.Namespace) -> int:
     try:
+        import diffusers
         import torch
-        from diffusers import FluxPipeline
     except ImportError:
-        print("Inference requires diffusers and torch installed in the active environment.", file=sys.stderr)
+        print(
+            "Inference requires diffusers and torch installed in the active environment.",
+            file=sys.stderr,
+        )
         return 1
 
     config = load_config(Path(args.config))
@@ -304,21 +314,29 @@ def infer(args: argparse.Namespace) -> int:
     output_path = REPO_ROOT / infer_cfg["output_path"]
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    pipe = FluxPipeline.from_pretrained(
-        train_cfg["model_name"],
-        torch_dtype=torch.bfloat16,
+    pipeline_cls = cast(Any, getattr(diffusers, "DiffusionPipeline"))
+    pipe = cast(
+        Any,
+        pipeline_cls.from_pretrained(
+            train_cfg["model_name"],
+            torch_dtype=getattr(torch, "bfloat16"),
+        ),
     )
     pipe.enable_model_cpu_offload()
     pipe.load_lora_weights(str(lora_dir), weight_name=weight_name)
 
-    image = pipe(
-        prompt=prompt,
-        height=infer_cfg["height"],
-        width=infer_cfg["width"],
-        guidance_scale=infer_cfg["guidance_scale"],
-        num_inference_steps=infer_cfg["num_inference_steps"],
-        max_sequence_length=train_cfg["max_sequence_length"],
-    ).images[0]
+    result = cast(
+        PipelineResult,
+        pipe(
+            prompt=prompt,
+            height=infer_cfg["height"],
+            width=infer_cfg["width"],
+            guidance_scale=infer_cfg["guidance_scale"],
+            num_inference_steps=infer_cfg["num_inference_steps"],
+            max_sequence_length=train_cfg["max_sequence_length"],
+        ),
+    )
+    image = result.images[0]
     image.save(output_path)
     print(json.dumps({"prompt": prompt, "output_path": str(output_path)}, indent=2))
     return 0
@@ -387,16 +405,24 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    prepare_parser = subparsers.add_parser("prepare-dataset", help="Normalize images into a local HF dataset.")
+    prepare_parser = subparsers.add_parser(
+        "prepare-dataset", help="Normalize images into a local HF dataset."
+    )
     prepare_parser.set_defaults(func=prepare_dataset)
 
-    install_parser = subparsers.add_parser("install", help="Install local and upstream training dependencies.")
+    install_parser = subparsers.add_parser(
+        "install", help="Install local and upstream training dependencies."
+    )
     install_parser.set_defaults(func=install)
 
-    train_parser = subparsers.add_parser("train", help="Launch the official diffusers FLUX LoRA trainer.")
+    train_parser = subparsers.add_parser(
+        "train", help="Launch the official diffusers FLUX LoRA trainer."
+    )
     train_parser.set_defaults(func=train)
 
-    infer_parser = subparsers.add_parser("infer", help="Run a quick inference pass with the trained LoRA.")
+    infer_parser = subparsers.add_parser(
+        "infer", help="Run a quick inference pass with the trained LoRA."
+    )
     infer_parser.add_argument("prompt", nargs="?", help="Optional prompt override.")
     infer_parser.set_defaults(func=infer)
 
@@ -410,7 +436,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
-        return args.func(args)
+        func = cast(CommandFunc, args.func)
+        return func(args)
     except subprocess.CalledProcessError as exc:
         print(f"Command failed with exit code {exc.returncode}: {exc.cmd}", file=sys.stderr)
         return exc.returncode or 1

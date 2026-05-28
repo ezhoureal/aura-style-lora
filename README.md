@@ -133,12 +133,6 @@ The default config is intentionally conservative for a small dataset:
 - gradient checkpointing on
 - latent caching on
 
-Artifacts are written to:
-
-```text
-outputs/flux-lora-zrlprfl/
-```
-
 ## 5. Test inference
 
 Once training finishes:
@@ -166,11 +160,3 @@ samples/flux-lora-test.png
 - Flux LoRA training is memory-heavy. This workspace defaults to 512px, rank 8, gradient checkpointing, and latent caching to make first runs more practical.
 - If your GPU still runs out of memory, reduce `resolution`, reduce `rank`, or increase `gradient_accumulation_steps`.
 
-## 7. Common commands
-
-```bash
-lora prepare-dataset
-lora train
-lora infer
-lora clean
-```
