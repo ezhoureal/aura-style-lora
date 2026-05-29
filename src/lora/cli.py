@@ -55,10 +55,12 @@ def build_prompt(subject: str, prompt_cfg: dict[str, Any]) -> str:
 
 def convert_image(source: Path, target: Path) -> None:
     from PIL import Image, ImageOps
+    from PIL.Image import Image as PILImage
 
     with Image.open(source) as image:
-        image = ImageOps.exif_transpose(image).convert("RGB")
-        image.save(target, format="PNG", optimize=True)
+        transposed = cast(PILImage, ImageOps.exif_transpose(image))
+        rgb_image = transposed.convert("RGB")
+        rgb_image.save(target, format="PNG", optimize=True)
 
 
 def prepare_dataset(args: argparse.Namespace) -> int:
@@ -266,6 +268,7 @@ def train(args: argparse.Namespace) -> int:
         "--report_to": train_cfg["report_to"],
         "--repeats": train_cfg["repeats"],
         "--max_sequence_length": train_cfg["max_sequence_length"],
+        "--dataloader_num_workers": train_cfg.get("dataloader_num_workers"),
     }
     for flag_name, value in flags.items():
         append_flag(command, flag_name, value)
@@ -291,7 +294,7 @@ def train(args: argparse.Namespace) -> int:
 
 def infer(args: argparse.Namespace) -> int:
     try:
-        import diffusers
+        import diffusers  # pyright: ignore[reportMissingImports]
         import torch
     except ImportError:
         print(

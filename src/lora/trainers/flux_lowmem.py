@@ -74,6 +74,7 @@ from diffusers import (
     FluxPipeline,
     FluxTransformer2DModel,
 )
+from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import (
     _collate_lora_metadata,
@@ -896,11 +897,13 @@ class DreamBoothDataset(Dataset):
 
     def __getitem__(self, index):
         example = {}
-        instance_image = self.pixel_values[index % self.num_instance_images]
+        instance_index = index % self.num_instance_images
+        instance_image = self.pixel_values[instance_index]
         example["instance_images"] = instance_image
+        example["instance_index"] = instance_index
 
         if self.custom_instance_prompts:
-            caption = self.custom_instance_prompts[index % self.num_instance_images]
+            caption = self.custom_instance_prompts[instance_index]
             if caption:
                 example["instance_prompt"] = caption
             else:
@@ -924,6 +927,7 @@ class DreamBoothDataset(Dataset):
 def collate_fn(examples, with_prior_preservation=False):
     pixel_values = [example["instance_images"] for example in examples]
     prompts = [example["instance_prompt"] for example in examples]
+    instance_indices = [example["instance_index"] for example in examples]
 
     # Concat class and instance examples for prior preservation.
     # We do this to avoid doing two forward passes.
@@ -934,8 +938,15 @@ def collate_fn(examples, with_prior_preservation=False):
     pixel_values = torch.stack(pixel_values)
     pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
 
-    batch = {"pixel_values": pixel_values, "prompts": prompts}
+    batch = {"pixel_values": pixel_values, "prompts": prompts, "instance_indices": instance_indices}
     return batch
+
+
+def collate_instance_latents(examples):
+    pixel_values = torch.stack([example["instance_images"] for example in examples])
+    pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
+    instance_indices = [example["instance_index"] for example in examples]
+    return {"pixel_values": pixel_values, "instance_indices": instance_indices}
 
 
 class PromptDataset(Dataset):
@@ -1095,6 +1106,61 @@ def encode_prompt(
     text_ids = torch.zeros(prompt_embeds.shape[1], 3).to(device=device, dtype=dtype)
 
     return prompt_embeds, pooled_prompt_embeds, text_ids
+
+
+def get_cached_text_embeddings(
+    prompt_embed_cache: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    prompts: Sequence[str],
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    cached = [prompt_embed_cache[prompt] for prompt in prompts]
+    prompt_embeds = torch.cat([entry[0] for entry in cached], dim=0).to(device)
+    pooled_prompt_embeds = torch.cat([entry[1] for entry in cached], dim=0).to(device)
+    text_ids = cached[0][2].to(device)
+    return prompt_embeds, pooled_prompt_embeds, text_ids
+
+
+def build_latents_cache(
+    train_dataset: Dataset,
+    vae: AutoencoderKL,
+    batch_size: int,
+    num_workers: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> list[torch.Tensor]:
+    latents_cache: list[torch.Tensor | None] = [None] * len(train_dataset)
+    latent_cache_loader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=collate_instance_latents,
+        num_workers=num_workers,
+    )
+    for batch in tqdm(latent_cache_loader, desc="Caching latents"):
+        with torch.no_grad():
+            pixel_values = batch["pixel_values"].to(device, non_blocking=True, dtype=dtype)
+            batch_latents = vae.encode(pixel_values).latent_dist
+            for latent_index, cached_latent in zip(batch["instance_indices"], batch_latents.parameters):
+                latents_cache[latent_index] = cached_latent.detach().cpu()
+
+    if any(cached_latent is None for cached_latent in latents_cache):
+        raise RuntimeError("Latent cache build was incomplete.")
+
+    return [cached_latent for cached_latent in latents_cache if cached_latent is not None]
+
+
+def get_cached_latent_dist(
+    latents_cache: Sequence[torch.Tensor],
+    instance_indices: Sequence[int],
+    device: torch.device,
+    dtype: torch.dtype,
+) -> DiagonalGaussianDistribution:
+    cached_latent_params = torch.stack([latents_cache[index] for index in instance_indices]).to(
+        device=device,
+        dtype=dtype,
+        non_blocking=True,
+    )
+    return DiagonalGaussianDistribution(cached_latent_params)
 
 
 def main(args: argparse.Namespace) -> None:
@@ -1305,10 +1371,6 @@ def main(args: argparse.Namespace) -> None:
 
     for prompt in sorted(prompts_to_cache):
         prompt_embed_cache[prompt] = tuple(tensor.cpu() for tensor in compute_text_embeddings(prompt, text_encoders, tokenizers))
-
-    def get_cached_text_embeddings(prompts):
-        cached = [prompt_embed_cache[prompt] for prompt in prompts]
-        return tuple(torch.cat([entry[index] for entry in cached], dim=0).to(accelerator.device) for index in range(3))
 
     del text_encoder_one, text_encoder_two, tokenizer_one, tokenizer_two, text_encoders, tokenizers
     text_encoder_one = None
@@ -1569,13 +1631,14 @@ def main(args: argparse.Namespace) -> None:
     vae_config_scaling_factor = vae.config.scaling_factor
     vae_config_block_out_channels = vae.config.block_out_channels
     if args.cache_latents:
-        latents_cache = []
-        for batch in tqdm(train_dataloader, desc="Caching latents"):
-            with torch.no_grad():
-                batch["pixel_values"] = batch["pixel_values"].to(
-                    accelerator.device, non_blocking=True, dtype=weight_dtype
-                )
-                latents_cache.append(vae.encode(batch["pixel_values"]).latent_dist)
+        latents_cache = build_latents_cache(
+            train_dataset=train_dataset,
+            vae=vae,
+            batch_size=args.train_batch_size,
+            num_workers=args.dataloader_num_workers,
+            device=accelerator.device,
+            dtype=weight_dtype,
+        )
 
         if not args.validation_prompt or args.num_validation_images <= 0:
             del vae
@@ -1717,11 +1780,20 @@ def main(args: argparse.Namespace) -> None:
             with accelerator.accumulate(models_to_accumulate):
                 prompts = batch["prompts"]
 
-                prompt_embeds, pooled_prompt_embeds, text_ids = get_cached_text_embeddings(prompts)
+                prompt_embeds, pooled_prompt_embeds, text_ids = get_cached_text_embeddings(
+                    prompt_embed_cache,
+                    prompts,
+                    accelerator.device,
+                )
 
                 # Convert images to latent space
                 if args.cache_latents:
-                    model_input = latents_cache[step].sample()
+                    model_input = get_cached_latent_dist(
+                        latents_cache,
+                        batch["instance_indices"],
+                        accelerator.device,
+                        weight_dtype,
+                    ).sample()
                 else:
                     pixel_values = batch["pixel_values"].to(dtype=vae.dtype)
                     model_input = vae.encode(pixel_values).latent_dist.sample()

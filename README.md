@@ -131,9 +131,15 @@ The default config is intentionally conservative for a small dataset:
 - rank `8`
 - resolution `512`
 - `adamw` with learning rate `1e-4`
-- gradient checkpointing on
-- latent caching on
+- train batch size `2` with gradient accumulation `2`
+- dataloader workers `4`
 - in-training validation off, so the trainer does not reload the full inference pipeline while training
+
+If your GPU does not fit that profile, fall back in this order:
+
+- enable gradient checkpointing
+- reduce `train_batch_size` to `1`
+- increase `gradient_accumulation_steps` to keep the same effective batch size
 
 ## 5. Test inference
 
