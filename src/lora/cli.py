@@ -230,14 +230,11 @@ def train(args: argparse.Namespace) -> int:
         )
         return 1
 
-    script_path = REPO_ROOT / train_cfg.get(
-        "training_script", "scripts/train_dreambooth_lora_flux_lowmem.py"
-    )
-
     command = [
         "accelerate",
         "launch",
-        str(script_path),
+        "-m",
+        train_cfg.get("training_module", "lora.trainers.flux_lowmem"),
         "--pretrained_model_name_or_path",
         train_cfg["model_name"],
         "--dataset_name",
