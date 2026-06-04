@@ -4,13 +4,11 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
-import os
 import re
 import sys
 import time
 from pathlib import Path
 from typing import Any
-import huggingface_hub
 
 import torch
 from safetensors.torch import load_file, save_file
@@ -20,7 +18,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_LORA = REPO_ROOT / "fal_flux2_edit_lora" / "pytorch_lora_weights.safetensors"
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "outputs" / "local_flux2_edit_inference"
 DEFAULT_MODEL = "diffusers/FLUX.2-dev-bnb-4bit"
-DEFAULT_REMOTE_TEXT_ENCODER_URL = "https://remote-text-encoder-flux-2.huggingface.co/predict"
 DEFAULT_PROMPT = (
     "Transform this photorealistic image into the trained radiant aura style: smooth colorful "
     "gradients, ethereal haze, subtle contour lighting, and a refined cinematic glow. Preserve the "
@@ -76,19 +73,6 @@ def parse_args() -> argparse.Namespace:
         help="Do not download model files from Hugging Face.",
     )
     parser.add_argument(
-        "--remote-text-encoder-url",
-        default=DEFAULT_REMOTE_TEXT_ENCODER_URL,
-        help=(
-            "Endpoint that returns torch-serialized FLUX.2 prompt embeds. The 4-bit default model "
-            "uses this with text_encoder=None."
-        ),
-    )
-    parser.add_argument(
-        "--local-text-encoder",
-        action="store_true",
-        help="Load the model repo's local text encoder instead of using --remote-text-encoder-url.",
-    )
-    parser.add_argument(
         "--check-only",
         action="store_true",
         help="Validate/convert LoRA against the default Flux2Transformer2DModel shape without loading the base model.",
@@ -112,31 +96,24 @@ def require_module(import_name: str, install_name: str | None = None) -> None:
         raise RuntimeError(f"Missing required package `{package}`. Install it with `uv add {package}`.")
 
 
+def uses_4bit_model(model: str) -> bool:
+    return "bnb-4bit" in model.lower() or "4bit" in model.lower()
+
+
 def preflight_environment(args: argparse.Namespace) -> None:
     if args.check_only:
         return
 
-    require_module("requests")
     require_module("google.protobuf", "protobuf")
 
     device_name = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    uses_4bit_model = "bnb-4bit" in args.model.lower() or "4bit" in args.model.lower()
-    if uses_4bit_model:
+    if uses_4bit_model(args.model):
         require_module("bitsandbytes")
         if device_name == "cpu" or not torch.cuda.is_available():
             raise RuntimeError(
                 "The 4-bit FLUX.2 model needs a CUDA GPU with bitsandbytes. "
                 "This environment does not expose CUDA to PyTorch."
             )
-
-    if should_use_remote_text_encoder(args):
-        if not huggingface_hub.get_token():
-            raise RuntimeError(
-                "The remote FLUX.2 text encoder needs a Hugging Face token. "
-                "Set HF_TOKEN or run `huggingface-cli login`."
-            )
-
-
 def convert_fal_key(key: str, tensor: torch.Tensor) -> dict[str, torch.Tensor]:
     prefix = "base_model.model."
     if not key.startswith(prefix):
@@ -258,78 +235,61 @@ def validate_converted_lora(path: Path) -> dict[str, Any]:
     }
 
 
-def remote_text_encoder(url: str, prompt: str, device: torch.device) -> torch.Tensor:
-    import io
-
-    import requests
-
-    token = huggingface_hub.get_token()
-    if not token:
-        raise RuntimeError("Missing Hugging Face token for the remote FLUX.2 text encoder.")
-
-    response = requests.post(
-        url,
-        json={"prompt": prompt},
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        },
-        timeout=300,
-    )
-    if response.status_code != 200:
-        preview = response.text[:500].replace("\n", " ")
-        raise RuntimeError(
-            f"Remote text encoder failed with HTTP {response.status_code}: {preview}"
-        )
-
-    content = response.content.lstrip()
-    content_type = response.headers.get("content-type", "")
-    if content.startswith(b"<") or "text/html" in content_type:
-        preview = response.text[:500].replace("\n", " ")
-        raise RuntimeError(
-            "Remote text encoder returned HTML instead of torch prompt embeddings. "
-            "This usually means the Hugging Face token is missing/invalid, the FLUX.2-dev "
-            f"gating was not accepted, or the endpoint is unavailable. Response preview: {preview}"
-        )
-    if content.startswith(b"{") or "application/json" in content_type:
-        preview = response.text[:500].replace("\n", " ")
-        raise RuntimeError(
-            "Remote text encoder returned JSON instead of torch prompt embeddings. "
-            f"Response preview: {preview}"
-        )
-
-    # The official FLUX.2 remote text encoder returns torch-serialized prompt embeds.
-    # PyTorch 2.6+ defaults to weights_only=True, which cannot read this response.
-    return torch.load(io.BytesIO(response.content), map_location=device, weights_only=False)
-
-
-def should_use_remote_text_encoder(args: argparse.Namespace) -> bool:
-    return bool(args.remote_text_encoder_url) and not args.local_text_encoder
-
-
-def run_inference(args: argparse.Namespace, lora_path: Path) -> Path:
+def load_flux2_pipeline(args: argparse.Namespace, dtype: torch.dtype | str, device_name: str):
     from diffusers import Flux2Pipeline
-    from diffusers.utils import load_image
 
-    device_name = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    device = torch.device(device_name)
-    dtype = dtype_from_arg(args.torch_dtype)
+    if uses_4bit_model(args.model) and device_name.startswith("cuda"):
+        from diffusers import AutoModel
+        from transformers import Mistral3ForConditionalGeneration
+
+        print("Loading 4-bit FLUX.2 with local text encoder on CPU and model CPU offload.", flush=True)
+        text_encoder = Mistral3ForConditionalGeneration.from_pretrained(
+            args.model,
+            subfolder="text_encoder",
+            torch_dtype=dtype,
+            device_map="cpu",
+            local_files_only=args.local_files_only,
+        )
+        transformer = AutoModel.from_pretrained(
+            args.model,
+            subfolder="transformer",
+            torch_dtype=dtype,
+            device_map="cpu",
+            local_files_only=args.local_files_only,
+        )
+        pipe = Flux2Pipeline.from_pretrained(
+            args.model,
+            text_encoder=text_encoder,
+            transformer=transformer,
+            torch_dtype=dtype,
+            local_files_only=args.local_files_only,
+        )
+        pipe.enable_model_cpu_offload()
+        return pipe
 
     load_kwargs: dict[str, Any] = {
         "torch_dtype": dtype,
         "local_files_only": args.local_files_only,
     }
-    use_remote_text_encoder = should_use_remote_text_encoder(args)
     if args.device_map is not None:
         load_kwargs["device_map"] = args.device_map
-    elif device.type == "cuda":
+    elif device_name.startswith("cuda"):
         load_kwargs["device_map"] = device_name
-    if use_remote_text_encoder:
-        load_kwargs["text_encoder"] = None
 
     pipe = Flux2Pipeline.from_pretrained(args.model, **load_kwargs)
     if "device_map" not in load_kwargs:
-        pipe.to(device)
+        pipe.to(device_name)
+    return pipe
+
+
+def run_inference(args: argparse.Namespace, lora_path: Path) -> Path:
+    from diffusers.utils import load_image
+
+    device_name = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = dtype_from_arg(args.torch_dtype)
+
+    print("Using text encoder mode: local", flush=True)
+    pipe = load_flux2_pipeline(args, dtype, device_name)
     pipe.load_lora_weights(str(lora_path), adapter_name="aura")
     pipe.set_adapters(["aura"], adapter_weights=[args.lora_scale])
 
@@ -346,10 +306,7 @@ def run_inference(args: argparse.Namespace, lora_path: Path) -> Path:
         "guidance_scale": args.guidance_scale,
         "generator": generator,
     }
-    if use_remote_text_encoder:
-        call_kwargs["prompt_embeds"] = remote_text_encoder(args.remote_text_encoder_url, args.prompt, device)
-    else:
-        call_kwargs["prompt"] = args.prompt
+    call_kwargs["prompt"] = args.prompt
 
     image = pipe(**call_kwargs).images[0]
     output_path = args.output_path or (args.output_dir / "flux2-local-stylized.png")
@@ -382,9 +339,7 @@ def main() -> int:
 
     report: dict[str, Any] = {
         "model": args.model,
-        "remote_text_encoder_url": None
-        if args.local_text_encoder
-        else args.remote_text_encoder_url,
+        "text_encoder_mode": "local",
         "lora": str(lora_path),
         "converted_lora": str(converted_path),
         "conversion": conversion,
