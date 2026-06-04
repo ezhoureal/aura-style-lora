@@ -1,0 +1,20 @@
+{
+  "image_data_url": "https://v3b.fal.media/files/b/0a9ce546/GN262VCdWL61Myf1fxI7j_flux2-edit-lora-pairs.zip",
+  "steps": 1000,
+  "learning_rate": 5e-05,
+  "default_caption": "Apply a radiant aura lighting style with smooth colorful gradients, ethereal haze, subtle contour lighting, and a refined cinematic glow while preserving the subject and composition.",
+  "output_lora_format": "fal",
+  "image_suffixes": [
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".webp",
+    ".bmp",
+    ".tiff"
+  ],
+  "prompt_suffixes": [
+    ".txt",
+    ".json",
+    ".jsonl"
+  ]
+}

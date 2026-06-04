@@ -8,6 +8,7 @@ dependencies = [
     "accelerate>=0.31.0",
     "datasets>=3.0.0",
     "diffusers @ git+https://github.com/huggingface/diffusers.git",
+    "fal-client>=0.7.0",
     "ftfy",
     "hf_transfer",
     "huggingface-hub>=0.31.0",
