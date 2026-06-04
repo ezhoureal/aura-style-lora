@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
+import os
 import re
 import sys
 import time
 from pathlib import Path
 from typing import Any
+import huggingface_hub
 
 import torch
 from safetensors.torch import load_file, save_file
@@ -101,6 +104,37 @@ def dtype_from_arg(value: str) -> torch.dtype | str:
         "float16": torch.float16,
         "bfloat16": torch.bfloat16,
     }[value]
+
+
+def require_module(import_name: str, install_name: str | None = None) -> None:
+    if importlib.util.find_spec(import_name) is None:
+        package = install_name or import_name
+        raise RuntimeError(f"Missing required package `{package}`. Install it with `uv add {package}`.")
+
+
+def preflight_environment(args: argparse.Namespace) -> None:
+    if args.check_only:
+        return
+
+    require_module("requests")
+    require_module("google.protobuf", "protobuf")
+
+    device_name = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    uses_4bit_model = "bnb-4bit" in args.model.lower() or "4bit" in args.model.lower()
+    if uses_4bit_model:
+        require_module("bitsandbytes")
+        if device_name == "cpu" or not torch.cuda.is_available():
+            raise RuntimeError(
+                "The 4-bit FLUX.2 model needs a CUDA GPU with bitsandbytes. "
+                "This environment does not expose CUDA to PyTorch."
+            )
+
+    if should_use_remote_text_encoder(args):
+        if not huggingface_hub.get_token():
+            raise RuntimeError(
+                "The remote FLUX.2 text encoder needs a Hugging Face token. "
+                "Set HF_TOKEN or run `huggingface-cli login`."
+            )
 
 
 def convert_fal_key(key: str, tensor: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -228,19 +262,45 @@ def remote_text_encoder(url: str, prompt: str, device: torch.device) -> torch.Te
     import io
 
     import requests
-    from huggingface_hub import get_token
+
+    token = huggingface_hub.get_token()
+    if not token:
+        raise RuntimeError("Missing Hugging Face token for the remote FLUX.2 text encoder.")
 
     response = requests.post(
         url,
         json={"prompt": prompt},
         headers={
-            "Authorization": f"Bearer {get_token()}",
+            "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
         },
         timeout=300,
     )
-    response.raise_for_status()
-    return torch.load(io.BytesIO(response.content), map_location=device)
+    if response.status_code != 200:
+        preview = response.text[:500].replace("\n", " ")
+        raise RuntimeError(
+            f"Remote text encoder failed with HTTP {response.status_code}: {preview}"
+        )
+
+    content = response.content.lstrip()
+    content_type = response.headers.get("content-type", "")
+    if content.startswith(b"<") or "text/html" in content_type:
+        preview = response.text[:500].replace("\n", " ")
+        raise RuntimeError(
+            "Remote text encoder returned HTML instead of torch prompt embeddings. "
+            "This usually means the Hugging Face token is missing/invalid, the FLUX.2-dev "
+            f"gating was not accepted, or the endpoint is unavailable. Response preview: {preview}"
+        )
+    if content.startswith(b"{") or "application/json" in content_type:
+        preview = response.text[:500].replace("\n", " ")
+        raise RuntimeError(
+            "Remote text encoder returned JSON instead of torch prompt embeddings. "
+            f"Response preview: {preview}"
+        )
+
+    # The official FLUX.2 remote text encoder returns torch-serialized prompt embeds.
+    # PyTorch 2.6+ defaults to weights_only=True, which cannot read this response.
+    return torch.load(io.BytesIO(response.content), map_location=device, weights_only=False)
 
 
 def should_use_remote_text_encoder(args: argparse.Namespace) -> bool:
@@ -339,6 +399,11 @@ def main() -> int:
         return 0
     if args.input_image is None:
         print("input_image is required unless --check-only is set.", file=sys.stderr)
+        return 1
+    try:
+        preflight_environment(args)
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
         return 1
 
     started_at = time.time()
