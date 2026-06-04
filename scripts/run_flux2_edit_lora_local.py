@@ -23,13 +23,19 @@ DEFAULT_PROMPT = (
     "gradients, ethereal haze, subtle contour lighting, and a refined cinematic glow. Preserve the "
     "subject identity, composition, pose, silhouette, camera framing, and important details."
 )
+SUPPORTED_IMAGE_SUFFIXES = {".avif", ".bmp", ".jpeg", ".jpg", ".png", ".webp"}
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run local FLUX.2 image editing with the fal-trained LoRA, or validate it offline."
     )
-    parser.add_argument("input_image", nargs="?", type=Path, help="Photorealistic input image.")
+    parser.add_argument(
+        "input_dir",
+        nargs="?",
+        type=Path,
+        help="Directory containing photorealistic input images.",
+    )
     parser.add_argument("--prompt", default=DEFAULT_PROMPT, help="Edit prompt.")
     parser.add_argument("--lora", type=Path, default=DEFAULT_LORA, help="Input LoRA safetensors file.")
     parser.add_argument(
@@ -45,6 +51,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--output-path", type=Path, default=None)
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help=(
+            "Number of input images to edit per pipeline call. Keep this low on <24GB VRAM; "
+            "try 2 first, then increase if memory allows."
+        ),
+    )
     parser.add_argument("--height", type=int, default=1024)
     parser.add_argument("--width", type=int, default=1024)
     parser.add_argument("--num-inference-steps", type=int, default=28)
@@ -282,37 +297,105 @@ def load_flux2_pipeline(args: argparse.Namespace, dtype: torch.dtype | str, devi
     return pipe
 
 
-def run_inference(args: argparse.Namespace, lora_path: Path) -> Path:
+def batched(values: list[Path], batch_size: int) -> list[list[Path]]:
+    return [values[index : index + batch_size] for index in range(0, len(values), batch_size)]
+
+
+def discover_input_images(input_dir: Path) -> list[Path]:
+    return sorted(
+        (
+            path
+            for path in input_dir.iterdir()
+            if path.is_file() and path.suffix.lower() in SUPPORTED_IMAGE_SUFFIXES
+        ),
+        key=lambda path: path.name.lower(),
+    )
+
+
+def output_paths_for_inputs(args: argparse.Namespace, input_images: list[Path]) -> list[Path]:
+    if args.output_path is None:
+        return [
+            args.output_dir / f"{input_path.stem}-flux2-local-stylized.png"
+            for input_path in input_images
+        ]
+
+    if args.output_path.suffix:
+        stem = args.output_path.with_suffix("")
+        suffix = args.output_path.suffix
+        return [
+            stem.with_name(f"{stem.name}-{index:04d}{suffix}")
+            for index, _input_path in enumerate(input_images, start=1)
+        ]
+
+    return [
+        args.output_path / f"{input_path.stem}-flux2-local-stylized.png"
+        for input_path in input_images
+    ]
+
+
+def generators_for_batch(
+    seed: int | None,
+    device_name: str,
+    *,
+    start_index: int,
+    batch_size: int,
+) -> torch.Generator | list[torch.Generator] | None:
+    if seed is None:
+        return None
+    if batch_size == 1:
+        return torch.Generator(device=device_name).manual_seed(seed + start_index)
+    return [
+        torch.Generator(device=device_name).manual_seed(seed + start_index + index)
+        for index in range(batch_size)
+    ]
+
+
+def run_inference(args: argparse.Namespace, lora_path: Path) -> list[Path]:
     from diffusers.utils import load_image
 
     device_name = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     dtype = dtype_from_arg(args.torch_dtype)
+    input_paths = discover_input_images(args.input_dir.expanduser().resolve())
+    output_paths = output_paths_for_inputs(args, input_paths)
 
+    print(
+        f"Found {len(input_paths)} input image(s). Processing in batches of {args.batch_size}.",
+        flush=True,
+    )
     print("Using text encoder mode: local", flush=True)
     pipe = load_flux2_pipeline(args, dtype, device_name)
     pipe.load_lora_weights(str(lora_path), adapter_name="aura")
     pipe.set_adapters(["aura"], adapter_weights=[args.lora_scale])
 
-    generator = None
-    if args.seed is not None:
-        generator = torch.Generator(device=device_name).manual_seed(args.seed)
+    for start_index, batch_paths in enumerate(batched(input_paths, args.batch_size)):
+        batch_offset = start_index * args.batch_size
+        input_images = [load_image(str(input_path)) for input_path in batch_paths]
+        image_arg: Any = input_images[0] if len(input_images) == 1 else input_images
+        prompt_arg: Any = args.prompt if len(input_images) == 1 else [args.prompt] * len(batch_paths)
+        call_kwargs: dict[str, Any] = {
+            "image": image_arg,
+            "height": args.height,
+            "width": args.width,
+            "num_inference_steps": args.num_inference_steps,
+            "guidance_scale": args.guidance_scale,
+            "generator": generators_for_batch(
+                args.seed,
+                device_name,
+                start_index=batch_offset,
+                batch_size=len(batch_paths),
+            ),
+            "prompt": prompt_arg,
+        }
 
-    input_image = load_image(str(args.input_image))
-    call_kwargs: dict[str, Any] = {
-        "image": input_image,
-        "height": args.height,
-        "width": args.width,
-        "num_inference_steps": args.num_inference_steps,
-        "guidance_scale": args.guidance_scale,
-        "generator": generator,
-    }
-    call_kwargs["prompt"] = args.prompt
+        images = pipe(**call_kwargs).images
+        if len(images) != len(batch_paths):
+            raise RuntimeError(f"Expected {len(batch_paths)} outputs from pipeline, received {len(images)}.")
 
-    image = pipe(**call_kwargs).images[0]
-    output_path = args.output_path or (args.output_dir / "flux2-local-stylized.png")
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    image.save(output_path)
-    return output_path
+        for image, output_path in zip(images, output_paths[batch_offset : batch_offset + len(images)]):
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            image.save(output_path)
+
+    return output_paths
 
 
 def main() -> int:
@@ -321,6 +404,28 @@ def main() -> int:
     if not lora_path.exists():
         print(f"LoRA file does not exist: {lora_path}", file=sys.stderr)
         return 1
+    if not args.check_only:
+        if args.input_dir is None:
+            print("input_dir is required unless --check-only is set.", file=sys.stderr)
+            return 1
+        if args.batch_size < 1:
+            print("--batch-size must be at least 1.", file=sys.stderr)
+            return 1
+        input_dir = args.input_dir.expanduser().resolve()
+        if not input_dir.exists():
+            print(f"Input directory does not exist: {input_dir}", file=sys.stderr)
+            return 1
+        if not input_dir.is_dir():
+            print(f"Input path is not a directory: {input_dir}", file=sys.stderr)
+            return 1
+        input_images = discover_input_images(input_dir)
+        if not input_images:
+            print(
+                f"No supported images found in {input_dir}. "
+                f"Supported extensions: {', '.join(sorted(SUPPORTED_IMAGE_SUFFIXES))}.",
+                file=sys.stderr,
+            )
+            return 1
 
     output_dir = args.output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -352,9 +457,6 @@ def main() -> int:
         return 1
     if args.check_only:
         return 0
-    if args.input_image is None:
-        print("input_image is required unless --check-only is set.", file=sys.stderr)
-        return 1
     try:
         preflight_environment(args)
     except RuntimeError as exc:
@@ -363,12 +465,13 @@ def main() -> int:
 
     started_at = time.time()
     try:
-        image_path = run_inference(args, converted_path)
+        image_paths = run_inference(args, converted_path)
     except Exception as exc:
         print(f"Local inference failed after {time.time() - started_at:.1f}s: {exc}", file=sys.stderr)
         return 1
 
-    print(f"Saved local FLUX.2 edit output: {image_path}")
+    for image_path in image_paths:
+        print(f"Saved local FLUX.2 edit output: {image_path}")
     return 0
 
 
