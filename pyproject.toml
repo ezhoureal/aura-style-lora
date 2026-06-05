@@ -1,7 +1,7 @@
 [project]
 name = "lora"
 version = "0.1.0"
-description = "Local tooling for preparing and training a FLUX.1-dev LoRA."
+description = "Local tooling for preparing and training a FLUX-dev LoRA."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
