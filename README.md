@@ -1,9 +1,127 @@
 # LoRA Training Workspace
 
-This repo is a minimal local workspace for training a style transfer LORA on various diffusion models.
+This repo trains paired image-edit style-transfer LoRAs. Each training row uses a
+photorealistic source image plus a target image in the desired style, and the model learns
+to transfer style while preserving identity, composition, pose, silhouette, camera framing,
+and important details.
 
-The training pipeline is "image to image". We always use a source photorealistic image and train the model to transfer its style.
+The active local target is `flux2_klein_base`, a FLUX.2 Klein/Base 4B paired-edit LoRA.
+Hydra config lives in `configs/local_edit_lora.yaml`; avoid ad hoc CLI argument drift by
+updating that YAML when changing training or eval settings.
 
-The dataset is uploaded to `ezhoureal/aura_style` on huggingface. Additional data should also be appended to it.
+## Current Status
 
-We compare the performance of the following models:
+- Active selected model: `flux2_klein_base`.
+- Dataset path: `dataset/train`.
+- Eval input path: `eval_data`.
+- Base model path: `${FLUX2_KLEIN_BASE_PATH}` or `.hf_models/flux2-klein-base-4b`.
+- Training completed to step `1000`.
+- Final checkpoint:
+  `outputs/ablation/local_edit_lora/flux2_klein_base/checkpoint-001000`.
+- Intermediate checkpoints exist at steps `250`, `500`, and `750`.
+- Latest eval artifacts are under:
+  `outputs/ablation/local_edit_eval/flux2_klein_base`.
+
+The Flux2 inference path intentionally runs one pipeline call per conditioning image. In
+Diffusers FLUX.2, passing `image=[...]` means multiple reference images for one edit, not
+a batch of independent edits. The repo still iterates eval inputs in configured chunks, but
+each image is sent to the pipeline independently so `eval04.webp` maps to `eval04-004.png`.
+
+## Layout
+
+- `src/lora/local_edit_common.py`: shared paths, dataset metadata, image loading, config,
+  batching, and seed helpers.
+- `src/lora/local_edit_flux2.py`: FLUX.2 paired-edit dataset, flow-matching objective,
+  trainer, LoRA loading, and inference.
+- `src/lora/local_edit_sd.py`: Stable Diffusion InstructPix2Pix dataset, trainer, UNet
+  input-channel patching, and inference.
+- `src/lora/local_edit_training.py`: Hydra training entrypoint and trainer dispatch.
+- `src/lora/local_edit_inference.py`: Hydra inference entrypoint and model dispatch.
+- `scripts/train_local_edit_lora.py`: local Hydra training wrapper.
+- `scripts/run_local_edit_lora.py`: local Hydra inference wrapper.
+
+## Environment
+
+Use the checked-in `uv` environment:
+
+```bash
+uv sync --dev
+```
+
+Check the GPU before training or eval:
+
+```bash
+nvidia-smi
+```
+
+The current config is tuned for a single RTX 4090-class GPU with BF16. Training minimizes
+VRAM by freezing non-LoRA modules, caching prompt embeddings, and moving the text encoder
+off GPU after cache construction.
+
+## Train
+
+Default training uses `configs/local_edit_lora.yaml`:
+
+```bash
+uv run scripts/train_local_edit_lora.py
+```
+
+Useful reproducible overrides for a smoke run:
+
+```bash
+uv run scripts/train_local_edit_lora.py \
+  training.max_train_steps=1 \
+  training.checkpointing_steps=1 \
+  training.output_root=outputs/smoke/flux2_local_edit_lora
+```
+
+## Evaluate
+
+Run local batch evaluation with the final checkpoint:
+
+```bash
+uv run scripts/run_local_edit_lora.py
+```
+
+By default, `evaluation.checkpoint_dir: null` resolves to:
+
+```text
+${training.output_root}/${model_key}/checkpoint-${training.max_train_steps}
+
+Eval outputs are written to:
+
+```text
+outputs/ablation/local_edit_eval/flux2_klein_base
+```
+
+## Validation
+
+Run all checks after edits:
+
+```bash
+.venv/bin/ruff format src tests scripts
+.venv/bin/ruff check src tests scripts
+.venv/bin/pyright src
+.venv/bin/pytest
+```
+
+Focused inference tests:
+
+```bash
+.venv/bin/pytest tests/test_local_edit_inference.py
+```
+
+Focused training tests:
+
+```bash
+.venv/bin/pytest tests/test_local_edit_training.py
+```
+
+## Notes
+
+- `selected_models` currently contains only `flux2_klein_base`.
+- SD 1.5 and SD 2.1 trainer code remains in the repo, but the active paired Flux2 path is
+  the one currently configured.
+- SD3 local paired-edit support is marked unsupported in config.
+- The eval code resizes/crops each Flux2 conditioning image to the configured eval canvas
+  before inference, matching the training resolution by default and keeping VRAM predictable.

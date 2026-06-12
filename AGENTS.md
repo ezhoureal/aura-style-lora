@@ -12,3 +12,6 @@
 - avoid absolute paths that are not reproducible in other environments. Design the repo to be robust and reproduce-friendly. Most important examples: do not commit paths under `/home/...`, local dataset/cache paths, local checkpoint paths, local Python binaries, or sibling-repo script paths like `../stable-worldmodel/scripts/...` unless they are explicitly documented, configurable, and not required by defaults. Prefer repo-relative paths, Hydra config interpolation, package/module entrypoints, env vars with documented defaults, and manifests that record exact checkpoint/dataset revisions.
 - Avoid using default arguments (x: int = 5) and Optional arguments (`| None` included) unless they are absolutely necessary, especially when defining function parameters.
 - Avoid capability-probing control flow like nested `hasattr(...)` / fallback `if` branches in core logic. Prefer explicit typed protocols, adapters, or single-purpose helper methods so runtime behavior is clear and unsupported objects fail loudly.
+
+## Caveats
+- Sometimes codex is initiated with `proxychains`, which might mess with `uv` package downloads. You can disable it with `env -u LD_PRELOAD -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy`.

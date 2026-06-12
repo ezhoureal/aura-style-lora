@@ -1,21 +1,22 @@
-selected_models: null
+selected_models:
+  - flux2_klein_base
 
 dataset:
-  train_dir: training_data/flux_aura_style/train
+  train_dir: dataset/train
   conditioning_key: conditioning_path
   image_key: file_name
   prompt_key: prompt
   kind_key: kind
   paired_kind: paired
-  resolution: 512
+  resolution: 1024
   center_crop: true
   random_flip: false
 
 training:
   output_root: outputs/ablation/local_edit_lora
-  max_train_steps: 1000
-  train_batch_size: 1
-  gradient_accumulation_steps: 4
+  max_train_steps: 2000
+  train_batch_size: 2
+  gradient_accumulation_steps: 2
   learning_rate: 1e-4
   lr_scheduler: constant
   lr_warmup_steps: 0
@@ -27,20 +28,48 @@ training:
   allow_tf32: true
   dataloader_num_workers: 2
   checkpointing_steps: 250
+  resume_from_checkpoint: latest # latest / null / specific path
   max_grad_norm: 1.0
+  guidance_scale: 4.0
+  max_sequence_length: 512
+  text_encoder_device: cuda
+  prompt_embed_batch_size: 2
+  text_encoder_out_layers:
+    - 9
+    - 18
+    - 27
+  local_files_only: false
+  flux2_target_modules:
+    - to_q
+    - to_k
+    - to_v
+    - to_out.0
+    - add_q_proj
+    - add_k_proj
+    - add_v_proj
+    - to_add_out
 
 evaluation:
   input_dir: eval_data
   output_root: outputs/ablation/local_edit_eval
   checkpoint_dir: null
-  prompt: "Transform this photorealistic image into the trained radiant aura style while preserving the subject identity, composition, pose, silhouette, camera framing, and important details."
+  prompt: "A strong colorful light is illuminating the subject's silhouette. The image is rendered in a smooth gradient of luminous light, giving a radiant and ethereal appearance. Subtle contour lighting highlights delicate outlines, adding depth and a refined, high-end cinematic glow"
+  batch_size: 2
+  height: ${dataset.resolution}
+  width: ${dataset.resolution}
   num_inference_steps: 28
-  guidance_scale: 7.5
+  guidance_scale: 4.0
   image_guidance_scale: 1.5
   lora_scale: 1.0
   seed: 42
   mixed_precision: bf16
   limit: null
+  max_sequence_length: 512
+  text_encoder_out_layers:
+    - 9
+    - 18
+    - 27
+  local_files_only: false
 
 environment:
   hf_endpoint: https://hf-mirror.com
@@ -68,6 +97,5 @@ models:
     note: Local paired edit LoRA support is not implemented for SD3 transformer edit APIs yet.
   flux2_klein_base:
     display_name: FLUX.2 Klein Base 4B
-    pretrained_model_name_or_path: black-forest-labs/FLUX.2-klein-base-4B
-    trainer: unsupported_local_edit
-    note: Local paired edit LoRA support is not implemented for FLUX.2 transformer edit APIs yet; use the fal edit trainer until a local transformer adapter is added.
+    pretrained_model_name_or_path: ${oc.env:FLUX2_KLEIN_BASE_PATH,.hf_models/flux2-klein-base-4b}
+    trainer: flux2_paired_edit_lora

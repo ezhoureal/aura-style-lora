@@ -18,12 +18,14 @@ dependencies = [
     "pillow>=10.4.0",
     "torch",
     "torchvision",
+    "tqdm>=4.66.0",
     "transformers>=4.41.2",
     "sentencepiece",
     "tensorboard",
     "bitsandbytes>=0.49.2",
     "protobuf>=7.35.0",
     "requests>=2.34.2",
+    "socksio>=1.0.0",
 ]
 
 [dependency-groups]
@@ -40,6 +42,10 @@ lora = "lora.cli:main"
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
+
 [tool.setuptools]
 package-dir = {"" = "src"}
 
@@ -54,4 +60,3 @@ venvPath = "."
 venv = ".venv"
 extraPaths = ["src"]
 pythonVersion = "3.12"
-
