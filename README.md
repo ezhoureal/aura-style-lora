@@ -16,9 +16,6 @@ updating that YAML when changing training or eval settings.
 - Eval input path: `eval_data`.
 - Base model path: `${FLUX2_KLEIN_BASE_PATH}` or `.hf_models/flux2-klein-base-4b`.
 - Training completed to step `1000`.
-- Final checkpoint:
-  `outputs/ablation/local_edit_lora/flux2_klein_base/checkpoint-001000`.
-- Intermediate checkpoints exist at steps `250`, `500`, and `750`.
 - Latest eval artifacts are under:
   `outputs/ablation/local_edit_eval/flux2_klein_base`.
 
@@ -92,29 +89,6 @@ Eval outputs are written to:
 
 ```text
 outputs/ablation/local_edit_eval/flux2_klein_base
-```
-
-## Validation
-
-Run all checks after edits:
-
-```bash
-.venv/bin/ruff format src tests scripts
-.venv/bin/ruff check src tests scripts
-.venv/bin/pyright src
-.venv/bin/pytest
-```
-
-Focused inference tests:
-
-```bash
-.venv/bin/pytest tests/test_local_edit_inference.py
-```
-
-Focused training tests:
-
-```bash
-.venv/bin/pytest tests/test_local_edit_training.py
 ```
 
 ## Notes
