@@ -333,7 +333,9 @@ def build_arguments(
     return request_arguments
 
 
-def run_with_fal(endpoint: str, request_arguments: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
+def run_with_fal(
+    endpoint: str, request_arguments: dict[str, Any]
+) -> tuple[dict[str, Any], str | None]:
     import fal_client
 
     result = fal_client.subscribe(

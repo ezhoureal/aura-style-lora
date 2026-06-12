@@ -218,7 +218,7 @@ def train_with_fal(args: argparse.Namespace, zip_path: Path) -> tuple[dict[str, 
             "it with `uv pip install fal-client`."
         ) from exc
 
-    image_data_url = fal_client.upload_file(str(zip_path)) # type: ignore
+    image_data_url = fal_client.upload_file(str(zip_path))  # type: ignore
     print(f"Uploaded dataset zip: {image_data_url}", flush=True)
 
     result = fal_client.subscribe(
@@ -306,7 +306,9 @@ def main() -> int:
 
     result_path = output_dir / "fal-training-result.json"
     result_path.write_text(
-        json.dumps({"request_id": request_id, "elapsed_seconds": elapsed, "result": result}, indent=2),
+        json.dumps(
+            {"request_id": request_id, "elapsed_seconds": elapsed, "result": result}, indent=2
+        ),
         encoding="utf-8",
     )
     print(f"Wrote result JSON: {result_path}")

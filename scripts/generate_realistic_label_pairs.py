@@ -299,7 +299,9 @@ def main() -> int:
             print(f"Refusing to overwrite existing files for {pair_name}", file=sys.stderr)
             return 1
 
-        print(f"[{index}/{len(plan)}] Generating realistic conditioning for {label.label_path.name}")
+        print(
+            f"[{index}/{len(plan)}] Generating realistic conditioning for {label.label_path.name}"
+        )
         image_bytes = ark_generate_image(args, label.label_path)
         conditioning_target.write_bytes(image_bytes)
         shutil.copy2(label.label_path, pair_target)

@@ -37,7 +37,9 @@ def parse_args() -> argparse.Namespace:
         help="Directory containing photorealistic input images.",
     )
     parser.add_argument("--prompt", default=DEFAULT_PROMPT, help="Edit prompt.")
-    parser.add_argument("--lora", type=Path, default=DEFAULT_LORA, help="Input LoRA safetensors file.")
+    parser.add_argument(
+        "--lora", type=Path, default=DEFAULT_LORA, help="Input LoRA safetensors file."
+    )
     parser.add_argument(
         "--converted-lora",
         type=Path,
@@ -108,7 +110,9 @@ def dtype_from_arg(value: str) -> torch.dtype | str:
 def require_module(import_name: str, install_name: str | None = None) -> None:
     if importlib.util.find_spec(import_name) is None:
         package = install_name or import_name
-        raise RuntimeError(f"Missing required package `{package}`. Install it with `uv add {package}`.")
+        raise RuntimeError(
+            f"Missing required package `{package}`. Install it with `uv add {package}`."
+        )
 
 
 def uses_4bit_model(model: str) -> bool:
@@ -129,6 +133,8 @@ def preflight_environment(args: argparse.Namespace) -> None:
                 "The 4-bit FLUX.2 model needs a CUDA GPU with bitsandbytes. "
                 "This environment does not expose CUDA to PyTorch."
             )
+
+
 def convert_fal_key(key: str, tensor: torch.Tensor) -> dict[str, torch.Tensor]:
     prefix = "base_model.model."
     if not key.startswith(prefix):
@@ -170,7 +176,9 @@ def convert_fal_key(key: str, tensor: torch.Tensor) -> dict[str, torch.Tensor]:
             return {f"{stem}.{target}{suffix}": tensor.clone() for target in targets}
 
         chunks = tensor.chunk(3, dim=0)
-        return {f"{stem}.{target}{suffix}": chunk.contiguous() for target, chunk in zip(targets, chunks)}
+        return {
+            f"{stem}.{target}{suffix}": chunk.contiguous() for target, chunk in zip(targets, chunks)
+        }
 
     single_match = re.fullmatch(r"single_blocks\.(\d+)\.(linear1|linear2)", base)
     if single_match:
@@ -257,7 +265,9 @@ def load_flux2_pipeline(args: argparse.Namespace, dtype: torch.dtype | str, devi
         from diffusers import AutoModel
         from transformers import Mistral3ForConditionalGeneration
 
-        print("Loading 4-bit FLUX.2 with local text encoder on CPU and model CPU offload.", flush=True)
+        print(
+            "Loading 4-bit FLUX.2 with local text encoder on CPU and model CPU offload.", flush=True
+        )
         text_encoder = Mistral3ForConditionalGeneration.from_pretrained(
             args.model,
             subfolder="text_encoder",
@@ -371,7 +381,9 @@ def run_inference(args: argparse.Namespace, lora_path: Path) -> list[Path]:
         batch_offset = start_index * args.batch_size
         input_images = [load_image(str(input_path)) for input_path in batch_paths]
         image_arg: Any = input_images[0] if len(input_images) == 1 else input_images
-        prompt_arg: Any = args.prompt if len(input_images) == 1 else [args.prompt] * len(batch_paths)
+        prompt_arg: Any = (
+            args.prompt if len(input_images) == 1 else [args.prompt] * len(batch_paths)
+        )
         call_kwargs: dict[str, Any] = {
             "image": image_arg,
             "height": args.height,
@@ -389,9 +401,13 @@ def run_inference(args: argparse.Namespace, lora_path: Path) -> list[Path]:
 
         images = pipe(**call_kwargs).images
         if len(images) != len(batch_paths):
-            raise RuntimeError(f"Expected {len(batch_paths)} outputs from pipeline, received {len(images)}.")
+            raise RuntimeError(
+                f"Expected {len(batch_paths)} outputs from pipeline, received {len(images)}."
+            )
 
-        for image, output_path in zip(images, output_paths[batch_offset : batch_offset + len(images)]):
+        for image, output_path in zip(
+            images, output_paths[batch_offset : batch_offset + len(images)]
+        ):
             output_path.parent.mkdir(parents=True, exist_ok=True)
             image.save(output_path)
 
@@ -467,7 +483,9 @@ def main() -> int:
     try:
         image_paths = run_inference(args, converted_path)
     except Exception as exc:
-        print(f"Local inference failed after {time.time() - started_at:.1f}s: {exc}", file=sys.stderr)
+        print(
+            f"Local inference failed after {time.time() - started_at:.1f}s: {exc}", file=sys.stderr
+        )
         return 1
 
     for image_path in image_paths:

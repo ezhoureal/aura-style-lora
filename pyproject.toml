@@ -3,7 +3,7 @@ name = "lora"
 version = "0.1.0"
 description = "Local tooling for preparing and training a FLUX-dev LoRA."
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
     "accelerate>=0.31.0",
     "datasets>=3.0.0",
@@ -12,11 +12,12 @@ dependencies = [
     "ftfy",
     "hf_transfer",
     "huggingface-hub>=0.31.0",
+    "hydra-core>=1.3.2",
     "jinja2",
     "peft>=0.11.1",
     "pillow>=10.4.0",
-    "torch==2.11.0+cu128",
-    "torchvision==0.26.0+cu128",
+    "torch",
+    "torchvision",
     "transformers>=4.41.2",
     "sentencepiece",
     "tensorboard",
@@ -39,10 +40,6 @@ lora = "lora.cli:main"
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
-[tool.uv.sources]
-torch = { index = "pytorch-cu128" }
-torchvision = { index = "pytorch-cu128" }
-
 [tool.setuptools]
 package-dir = {"" = "src"}
 
@@ -51,3 +48,10 @@ where = ["src"]
 
 [tool.ruff]
 line-length = 100
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
+extraPaths = ["src"]
+pythonVersion = "3.12"
+

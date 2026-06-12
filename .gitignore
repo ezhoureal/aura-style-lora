@@ -15,3 +15,4 @@ training_data/
 outputs/
 samples/
 dataset/
+.hf_models
