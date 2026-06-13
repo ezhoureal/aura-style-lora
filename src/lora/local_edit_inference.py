@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
@@ -31,6 +32,79 @@ from lora.local_edit_sd import load_sd_pipeline, run_sd_batch
 from lora.local_edit_sd3 import load_sd3_pipeline, run_sd3_batch
 
 
+PipelineLoader = Callable[[DictConfig, str, Path], Any]
+BatchRunner = Callable[[Any, DictConfig, list[Path], str, int], list[PILImage]]
+
+
+def run_sd_batch_adapter(
+    pipe: Any,
+    cfg: DictConfig,
+    input_paths: list[Path],
+    device_name: str,
+    batch_offset: int,
+) -> list[PILImage]:
+    return run_sd_batch(
+        cast(StableDiffusionInstructPix2PixPipeline, pipe),
+        cfg,
+        input_paths,
+        device_name,
+        batch_offset,
+    )
+
+
+def run_diffusion_batch_adapter(
+    runner: Callable[[DiffusionPipeline, DictConfig, list[Path], str, int], list[PILImage]],
+    pipe: Any,
+    cfg: DictConfig,
+    input_paths: list[Path],
+    device_name: str,
+    batch_offset: int,
+) -> list[PILImage]:
+    return runner(cast(DiffusionPipeline, pipe), cfg, input_paths, device_name, batch_offset)
+
+
+def run_sd3_batch_adapter(
+    pipe: Any,
+    cfg: DictConfig,
+    input_paths: list[Path],
+    device_name: str,
+    batch_offset: int,
+) -> list[PILImage]:
+    return run_diffusion_batch_adapter(
+        run_sd3_batch, pipe, cfg, input_paths, device_name, batch_offset
+    )
+
+
+def run_flux2_batch_adapter(
+    pipe: Any,
+    cfg: DictConfig,
+    input_paths: list[Path],
+    device_name: str,
+    batch_offset: int,
+) -> list[PILImage]:
+    return run_diffusion_batch_adapter(
+        run_flux2_batch,
+        pipe,
+        cfg,
+        input_paths,
+        device_name,
+        batch_offset,
+    )
+
+
+PIPELINE_LOADERS: dict[str, PipelineLoader] = {
+    "stable_diffusion_ip2p_lora": load_sd_pipeline,
+    "stable_diffusion_3_paired_edit_lora": load_sd3_pipeline,
+    "flux2_paired_edit_lora": load_flux2_pipeline,
+}
+
+BATCH_RUNNERS: dict[str, BatchRunner] = {
+    "stable_diffusion_ip2p_lora": run_sd_batch_adapter,
+    "stable_diffusion_3_paired_edit_lora": run_sd3_batch_adapter,
+    "flux2_paired_edit_lora": run_flux2_batch_adapter,
+}
+
+
 def checkpoint_dir_for_model(cfg: DictConfig, model_key: str) -> Path:
     configured = cfg.evaluation.checkpoint_dir
     if configured is not None:
@@ -42,12 +116,9 @@ def checkpoint_dir_for_model(cfg: DictConfig, model_key: str) -> Path:
 def load_pipeline(cfg: DictConfig, model_key: str, checkpoint_dir: Path) -> Any:
     model_cfg = cfg.models[model_key]
     trainer = str(model_cfg.trainer)
-    if trainer == "stable_diffusion_ip2p_lora":
-        return load_sd_pipeline(cfg, model_key, checkpoint_dir)
-    if trainer == "stable_diffusion_3_paired_edit_lora":
-        return load_sd3_pipeline(cfg, model_key, checkpoint_dir)
-    if trainer == "flux2_paired_edit_lora":
-        return load_flux2_pipeline(cfg, model_key, checkpoint_dir)
+    pipeline_loader = PIPELINE_LOADERS.get(trainer)
+    if pipeline_loader is not None:
+        return pipeline_loader(cfg, model_key, checkpoint_dir)
     raise NotImplementedError(f"Local inference is not implemented for trainer {trainer}")
 
 
@@ -60,22 +131,9 @@ def run_batch(
     batch_offset: int,
 ) -> list[PILImage]:
     trainer = str(cfg.models[model_key].trainer)
-    if trainer == "stable_diffusion_ip2p_lora":
-        return run_sd_batch(
-            cast(StableDiffusionInstructPix2PixPipeline, pipe),
-            cfg,
-            input_paths,
-            device_name,
-            batch_offset,
-        )
-    if trainer == "flux2_paired_edit_lora":
-        return run_flux2_batch(
-            cast(DiffusionPipeline, pipe), cfg, input_paths, device_name, batch_offset
-        )
-    if trainer == "stable_diffusion_3_paired_edit_lora":
-        return run_sd3_batch(
-            cast(DiffusionPipeline, pipe), cfg, input_paths, device_name, batch_offset
-        )
+    batch_runner = BATCH_RUNNERS.get(trainer)
+    if batch_runner is not None:
+        return batch_runner(pipe, cfg, input_paths, device_name, batch_offset)
     raise NotImplementedError(f"Local inference is not implemented for trainer {trainer}")
 
 
@@ -136,6 +194,7 @@ def main() -> None:
 
 __all__ = [
     "batched_paths",
+    "BatchRunner",
     "checkpoint_dir_for_model",
     "configure_environment",
     "discover_images",
@@ -144,12 +203,18 @@ __all__ = [
     "load_flux2_pipeline",
     "load_pipeline",
     "load_rgb_image",
+    "PipelineLoader",
+    "PIPELINE_LOADERS",
+    "BATCH_RUNNERS",
     "load_sd3_pipeline",
     "load_sd_pipeline",
     "run",
     "run_batch",
+    "run_flux2_batch_adapter",
     "run_flux2_batch",
     "run_model",
+    "run_sd3_batch_adapter",
     "run_sd3_batch",
+    "run_sd_batch_adapter",
     "run_sd_batch",
 ]

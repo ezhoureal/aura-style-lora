@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import json
-import math
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -10,10 +7,8 @@ from typing import Any, cast
 import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
-from accelerate.utils import ProjectConfiguration, set_seed
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from diffusers.models.unets.unet_2d_condition import UNet2DConditionModel
-from diffusers.optimization import get_scheduler
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_instruct_pix2pix import (
     StableDiffusionInstructPix2PixPipeline,
 )
@@ -29,19 +24,25 @@ from transformers import CLIPTextModel, CLIPTokenizer
 from lora.local_edit_common import (
     PairExample,
     apply_lora_checkpoint,
+    checkpoint_dir_for_step,
+    configure_training_runtime,
     dtype_from_precision,
     evaluation_seed,
     freeze_module,
     generators_for_batch,
+    load_condition_image,
     load_pair_examples,
-    load_rgb_image,
     load_transformed_pair,
+    make_accelerator,
     make_pair_image_transform,
-    make_training_progress,
+    make_lr_scheduler,
+    make_optimizer,
+    make_training_plan,
     none_if_null,
     resolve_resume_checkpoint,
-    resolve_repo_path,
-    trainable_parameters,
+    run_training_loop,
+    trainer_output_dir,
+    write_training_manifest,
 )
 
 
@@ -130,8 +131,7 @@ class StableDiffusionIp2PLoraTrainer:
         self.cfg = cfg
         self.model_key = model_key
         self.model_cfg = cfg.models[model_key]
-        output_root = resolve_repo_path(str(cfg.training.output_root))
-        self.output_dir = output_root / model_key
+        self.output_dir = trainer_output_dir(cfg, model_key)
 
     def train(self) -> Path:
         training_cfg = self.cfg.training
@@ -139,18 +139,8 @@ class StableDiffusionIp2PLoraTrainer:
         revision = none_if_null(self.model_cfg.get("revision"))
         variant = none_if_null(self.model_cfg.get("variant"))
         weight_dtype = dtype_from_precision(str(training_cfg.mixed_precision))
-        logging_dir = self.output_dir / "logs"
-        accelerator = Accelerator(
-            gradient_accumulation_steps=int(training_cfg.gradient_accumulation_steps),
-            mixed_precision=str(training_cfg.mixed_precision),
-            project_config=ProjectConfiguration(
-                project_dir=str(self.output_dir),
-                logging_dir=str(logging_dir),
-            ),
-        )
-        set_seed(int(training_cfg.seed))
-        if bool(training_cfg.allow_tf32):
-            torch.backends.cuda.matmul.allow_tf32 = True
+        accelerator = make_accelerator(training_cfg, self.output_dir)
+        configure_training_runtime(training_cfg)
 
         load_kwargs: dict[str, Any] = {}
         if revision is not None:
@@ -222,27 +212,13 @@ class StableDiffusionIp2PLoraTrainer:
             collate_fn=collate_batches,
             num_workers=int(training_cfg.dataloader_num_workers),
         )
-        optimizer = torch.optim.AdamW(
-            trainable_parameters(unet), lr=float(training_cfg.learning_rate)
-        )
-        updates_per_epoch = math.ceil(
-            len(dataloader) / int(training_cfg.gradient_accumulation_steps)
-        )
-        initial_step = 0 if resume_checkpoint is None else resume_checkpoint.step
-        remaining_steps = int(training_cfg.max_train_steps) - initial_step
-        if remaining_steps <= 0:
-            final_dir = self.save(accelerator, unet, initial_step)
+        optimizer = make_optimizer(unet, training_cfg)
+        training_plan = make_training_plan(len(dataloader), training_cfg, resume_checkpoint)
+        if training_plan.remaining_steps <= 0:
+            final_dir = self.save(accelerator, unet, training_plan.initial_step)
             accelerator.end_training()
             return final_dir
-        num_train_epochs = math.ceil(remaining_steps / updates_per_epoch)
-        lr_scheduler = get_scheduler(
-            str(training_cfg.lr_scheduler),
-            optimizer=optimizer,
-            num_warmup_steps=int(training_cfg.lr_warmup_steps)
-            * int(training_cfg.gradient_accumulation_steps),
-            num_training_steps=int(training_cfg.max_train_steps)
-            * int(training_cfg.gradient_accumulation_steps),
-        )
+        lr_scheduler = make_lr_scheduler(training_cfg, optimizer)
 
         unet, optimizer, dataloader, lr_scheduler = accelerator.prepare(
             unet,
@@ -252,49 +228,37 @@ class StableDiffusionIp2PLoraTrainer:
         )
         vae.to(accelerator.device, dtype=weight_dtype)
         text_encoder.to(accelerator.device, dtype=weight_dtype)
-        global_step = initial_step
         unet.train()
+        unet_model = cast(UNet2DConditionModel, unet)
 
-        with make_training_progress(
-            accelerator,
-            int(training_cfg.max_train_steps),
-            global_step,
-            f"Training {self.model_key}",
-        ) as progress:
-            for _epoch in range(num_train_epochs):
-                for batch in dataloader:
-                    with accelerator.accumulate(unet):
-                        loss = self.training_step(
-                            accelerator=accelerator,
-                            batch=batch,
-                            vae=vae,
-                            text_encoder=text_encoder,
-                            unet=cast(UNet2DConditionModel, unet),
-                            noise_scheduler=noise_scheduler,
-                            weight_dtype=weight_dtype,
-                        )
-                        accelerator.backward(loss)
-                        if accelerator.sync_gradients:
-                            accelerator.clip_grad_norm_(
-                                trainable_parameters(cast(nn.Module, unet)),
-                                float(training_cfg.max_grad_norm),
-                            )
-                        optimizer.step()
-                        lr_scheduler.step()
-                        optimizer.zero_grad(set_to_none=True)
+        def loss_step(batch: PreparedBatch) -> Tensor:
+            return self.training_step(
+                accelerator=accelerator,
+                batch=batch,
+                vae=vae,
+                text_encoder=text_encoder,
+                unet=unet_model,
+                noise_scheduler=noise_scheduler,
+                weight_dtype=weight_dtype,
+            )
 
-                    if accelerator.sync_gradients:
-                        global_step += 1
-                        progress.update(1)
-                        progress.set_postfix(loss=f"{float(loss.detach()):.4f}")
-                        if global_step % int(training_cfg.checkpointing_steps) == 0:
-                            self.save(accelerator, cast(UNet2DConditionModel, unet), global_step)
-                        if global_step >= int(training_cfg.max_train_steps):
-                            break
-                if global_step >= int(training_cfg.max_train_steps):
-                    break
+        def write_checkpoint(step: int) -> Path:
+            return self.save(accelerator, unet_model, step)
 
-        final_dir = self.save(accelerator, cast(UNet2DConditionModel, unet), global_step)
+        global_step = run_training_loop(
+            accelerator=accelerator,
+            train_model=unet_model,
+            dataloader=dataloader,
+            optimizer=optimizer,
+            lr_scheduler=lr_scheduler,
+            training_cfg=training_cfg,
+            model_key=self.model_key,
+            plan=training_plan,
+            loss_step=loss_step,
+            write_checkpoint=write_checkpoint,
+        )
+
+        final_dir = self.save(accelerator, unet_model, global_step)
         accelerator.end_training()
         return final_dir
 
@@ -338,7 +302,7 @@ class StableDiffusionIp2PLoraTrainer:
     def save(self, accelerator: Accelerator, unet: UNet2DConditionModel, step: int) -> Path:
         if not accelerator.is_main_process:
             return self.output_dir
-        save_dir = self.output_dir / f"checkpoint-{step:06d}"
+        save_dir = checkpoint_dir_for_step(self.output_dir, step)
         save_dir.mkdir(parents=True, exist_ok=True)
         unwrapped_unet = accelerator.unwrap_model(unet)
         cast(UNet2DConditionModel, unwrapped_unet).save_lora_adapter(
@@ -355,20 +319,7 @@ class StableDiffusionIp2PLoraTrainer:
             save_dir / "unet_conv_in_8ch.safetensors",
             metadata={"format": "pt", "source": "local_edit_lora"},
         )
-        manifest = {
-            "model_key": self.model_key,
-            "model_id": str(self.model_cfg.pretrained_model_name_or_path),
-            "trainer": str(self.model_cfg.trainer),
-            "step": step,
-            "requires_source_image": True,
-            "conditioning": "source_latents_concatenated_to_noisy_target_latents",
-            "lora_rank": int(self.cfg.training.rank),
-            "lora_alpha": int(self.cfg.training.lora_alpha),
-            "dataset_train_dir": str(self.cfg.dataset.train_dir),
-            "hf_endpoint": os.environ.get("HF_ENDPOINT", ""),
-        }
-        with (save_dir / "training_manifest.json").open("w", encoding="utf-8") as handle:
-            json.dump(manifest, handle, indent=2)
+        write_training_manifest(save_dir, self.cfg, self.model_key, self.model_cfg, step)
         return save_dir
 
 
@@ -432,8 +383,10 @@ def run_sd_batch(
     device_name: str,
     batch_offset: int,
 ) -> list[PILImage]:
+    width = int(cfg.evaluation.width)
+    height = int(cfg.evaluation.height)
     prompts = [str(cfg.evaluation.prompt)] * len(input_paths)
-    images = [load_rgb_image(input_path) for input_path in input_paths]
+    images = [load_condition_image(input_path, width, height) for input_path in input_paths]
     result = cast(
         Any,
         pipe(

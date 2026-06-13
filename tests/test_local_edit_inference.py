@@ -9,7 +9,12 @@ from omegaconf import OmegaConf
 from PIL import Image
 from PIL.Image import Image as PILImage
 
-from lora.local_edit_inference import batched_paths, generators_for_batch, run_flux2_batch
+from lora.local_edit_inference import (
+    batched_paths,
+    generators_for_batch,
+    run_flux2_batch,
+    run_sd_batch,
+)
 from lora.local_edit_training import REPO_ROOT
 
 
@@ -22,6 +27,18 @@ class FakeFlux2Pipeline:
     def __call__(self, **kwargs: Any) -> Any:
         self.calls.append(kwargs)
         return FakePipelineOutput([Image.new("RGB", (8, 8), "white")])
+
+
+class FakeStableDiffusionPipeline:
+    calls: list[dict[str, Any]]
+
+    def __init__(self) -> None:
+        self.calls = []
+
+    def __call__(self, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
+        images = kwargs["image"]
+        return FakePipelineOutput([Image.new("RGB", (16, 12), "white") for _image in images])
 
 
 class FakePipelineOutput:
@@ -49,6 +66,44 @@ class BatchHelperTests(unittest.TestCase):
         self.assertIsInstance(generators, list)
         self.assertEqual(generators[0].initial_seed(), 14)
         self.assertEqual(generators[1].initial_seed(), 15)
+
+
+class StableDiffusionBatchInferenceTests(unittest.TestCase):
+    def test_sd_batch_resizes_condition_images_to_configured_eval_size(self) -> None:
+        with tempfile.TemporaryDirectory(dir=REPO_ROOT) as tmp:
+            root = Path(tmp)
+            input_paths = [root / "wide.png", root / "tall.png"]
+            Image.new("RGB", (2000, 1000), "black").save(input_paths[0])
+            Image.new("RGB", (600, 1200), "black").save(input_paths[1])
+
+            cfg = OmegaConf.create(
+                {
+                    "evaluation": {
+                        "prompt": "make it aura style",
+                        "height": 640,
+                        "width": 384,
+                        "num_inference_steps": 8,
+                        "guidance_scale": 4.0,
+                        "image_guidance_scale": 1.5,
+                        "seed": 100,
+                    }
+                }
+            )
+            pipe = FakeStableDiffusionPipeline()
+
+            images = run_sd_batch(pipe, cfg, input_paths, "cpu", 6)  # type: ignore[arg-type]
+
+        self.assertEqual(len(images), 2)
+        self.assertEqual(len(pipe.calls), 1)
+        self.assertEqual(pipe.calls[0]["prompt"], ["make it aura style", "make it aura style"])
+        self.assertEqual([image.size for image in pipe.calls[0]["image"]], [(384, 640), (384, 640)])
+        self.assertEqual(pipe.calls[0]["num_inference_steps"], 8)
+        self.assertEqual(pipe.calls[0]["guidance_scale"], 4.0)
+        self.assertEqual(pipe.calls[0]["image_guidance_scale"], 1.5)
+        generators = pipe.calls[0]["generator"]
+        self.assertIsInstance(generators, list)
+        self.assertEqual(generators[0].initial_seed(), 106)
+        self.assertEqual(generators[1].initial_seed(), 107)
 
 
 class Flux2BatchInferenceTests(unittest.TestCase):

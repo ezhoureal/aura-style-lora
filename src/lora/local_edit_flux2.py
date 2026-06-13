@@ -1,41 +1,41 @@
 from __future__ import annotations
 
-import json
-import math
-import os
 from pathlib import Path
 from typing import Any, cast
 
 import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
-from accelerate.utils import ProjectConfiguration, set_seed
 from diffusers.models.transformers.transformer_flux2 import Flux2Transformer2DModel
-from diffusers.optimization import get_scheduler
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from omegaconf import DictConfig
-from PIL import Image, ImageOps
 from PIL.Image import Image as PILImage
 from peft import LoraConfig
-from torch import Tensor, nn
+from torch import Tensor
 from torch.utils.data import DataLoader
 
 from lora.local_edit_common import (
     PairedPromptBatch,
     PairedPromptDataset,
     apply_lora_checkpoint,
+    checkpoint_dir_for_step,
     collate_paired_prompt_batches,
+    configure_training_runtime,
     dtype_from_precision,
     evaluation_seed,
     freeze_module,
     generators_for_batch,
+    load_condition_image,
     load_pair_examples,
-    load_rgb_image,
-    make_training_progress,
+    make_accelerator,
+    make_lr_scheduler,
+    make_optimizer,
+    make_training_plan,
     none_if_null,
     resolve_resume_checkpoint,
-    resolve_repo_path,
-    trainable_parameters,
+    run_training_loop,
+    trainer_output_dir,
+    write_training_manifest,
 )
 
 
@@ -59,25 +59,14 @@ class Flux2PairedEditLoraTrainer:
         self.cfg = cfg
         self.model_key = model_key
         self.model_cfg = cfg.models[model_key]
-        output_root = resolve_repo_path(str(cfg.training.output_root))
-        self.output_dir = output_root / model_key
+        self.output_dir = trainer_output_dir(cfg, model_key)
 
     def train(self) -> Path:
         training_cfg = self.cfg.training
         model_id = str(self.model_cfg.pretrained_model_name_or_path)
         weight_dtype = dtype_from_precision(str(training_cfg.mixed_precision))
-        logging_dir = self.output_dir / "logs"
-        accelerator = Accelerator(
-            gradient_accumulation_steps=int(training_cfg.gradient_accumulation_steps),
-            mixed_precision=str(training_cfg.mixed_precision),
-            project_config=ProjectConfiguration(
-                project_dir=str(self.output_dir),
-                logging_dir=str(logging_dir),
-            ),
-        )
-        set_seed(int(training_cfg.seed))
-        if bool(training_cfg.allow_tf32):
-            torch.backends.cuda.matmul.allow_tf32 = True
+        accelerator = make_accelerator(training_cfg, self.output_dir)
+        configure_training_runtime(training_cfg)
 
         pipe = DiffusionPipeline.from_pretrained(
             model_id,
@@ -121,29 +110,14 @@ class Flux2PairedEditLoraTrainer:
             collate_fn=collate_flux_batches,
             num_workers=int(training_cfg.dataloader_num_workers),
         )
-        optimizer = torch.optim.AdamW(
-            trainable_parameters(pipe.transformer), lr=float(training_cfg.learning_rate)
-        )
-        updates_per_epoch = math.ceil(
-            len(dataloader) / int(training_cfg.gradient_accumulation_steps)
-        )
-        initial_step = 0 if resume_checkpoint is None else resume_checkpoint.step
-        remaining_steps = int(training_cfg.max_train_steps) - initial_step
-        if remaining_steps <= 0:
-            final_dir = self.save(
-                accelerator, cast(Flux2Transformer2DModel, pipe.transformer), initial_step
-            )
+        transformer_model = cast(Flux2Transformer2DModel, pipe.transformer)
+        optimizer = make_optimizer(transformer_model, training_cfg)
+        training_plan = make_training_plan(len(dataloader), training_cfg, resume_checkpoint)
+        if training_plan.remaining_steps <= 0:
+            final_dir = self.save(accelerator, transformer_model, training_plan.initial_step)
             accelerator.end_training()
             return final_dir
-        num_train_epochs = math.ceil(remaining_steps / updates_per_epoch)
-        lr_scheduler = get_scheduler(
-            str(training_cfg.lr_scheduler),
-            optimizer=optimizer,
-            num_warmup_steps=int(training_cfg.lr_warmup_steps)
-            * int(training_cfg.gradient_accumulation_steps),
-            num_training_steps=int(training_cfg.max_train_steps)
-            * int(training_cfg.gradient_accumulation_steps),
-        )
+        lr_scheduler = make_lr_scheduler(training_cfg, optimizer)
 
         prompt_cache = self.build_prompt_cache(
             pipe=pipe,
@@ -160,53 +134,35 @@ class Flux2PairedEditLoraTrainer:
             dataloader,
             lr_scheduler,
         )
+        transformer_model = cast(Flux2Transformer2DModel, pipe.transformer)
 
-        global_step = initial_step
-        with make_training_progress(
-            accelerator,
-            int(training_cfg.max_train_steps),
-            global_step,
-            f"Training {self.model_key}",
-        ) as progress:
-            for _epoch in range(num_train_epochs):
-                for batch in dataloader:
-                    with accelerator.accumulate(pipe.transformer):
-                        loss = self.training_step(
-                            accelerator=accelerator,
-                            batch=batch,
-                            pipe=pipe,
-                            transformer=cast(Flux2Transformer2DModel, pipe.transformer),
-                            prompt_cache=prompt_cache,
-                            weight_dtype=weight_dtype,
-                        )
-                        accelerator.backward(loss)
-                        if accelerator.sync_gradients:
-                            accelerator.clip_grad_norm_(
-                                trainable_parameters(cast(nn.Module, pipe.transformer)),
-                                float(training_cfg.max_grad_norm),
-                            )
-                        optimizer.step()
-                        lr_scheduler.step()
-                        optimizer.zero_grad(set_to_none=True)
+        def loss_step(batch: FluxPreparedBatch) -> Tensor:
+            return self.training_step(
+                accelerator=accelerator,
+                batch=batch,
+                pipe=pipe,
+                transformer=transformer_model,
+                prompt_cache=prompt_cache,
+                weight_dtype=weight_dtype,
+            )
 
-                    if accelerator.sync_gradients:
-                        global_step += 1
-                        progress.update(1)
-                        progress.set_postfix(loss=f"{float(loss.detach()):.4f}")
-                        if global_step % int(training_cfg.checkpointing_steps) == 0:
-                            self.save(
-                                accelerator,
-                                cast(Flux2Transformer2DModel, pipe.transformer),
-                                global_step,
-                            )
-                        if global_step >= int(training_cfg.max_train_steps):
-                            break
-                if global_step >= int(training_cfg.max_train_steps):
-                    break
+        def write_checkpoint(step: int) -> Path:
+            return self.save(accelerator, transformer_model, step)
 
-        final_dir = self.save(
-            accelerator, cast(Flux2Transformer2DModel, pipe.transformer), global_step
+        global_step = run_training_loop(
+            accelerator=accelerator,
+            train_model=transformer_model,
+            dataloader=dataloader,
+            optimizer=optimizer,
+            lr_scheduler=lr_scheduler,
+            training_cfg=training_cfg,
+            model_key=self.model_key,
+            plan=training_plan,
+            loss_step=loss_step,
+            write_checkpoint=write_checkpoint,
         )
+
+        final_dir = self.save(accelerator, transformer_model, global_step)
         accelerator.end_training()
         return final_dir
 
@@ -294,7 +250,7 @@ class Flux2PairedEditLoraTrainer:
     ) -> Path:
         if not accelerator.is_main_process:
             return self.output_dir
-        save_dir = self.output_dir / f"checkpoint-{step:06d}"
+        save_dir = checkpoint_dir_for_step(self.output_dir, step)
         save_dir.mkdir(parents=True, exist_ok=True)
         unwrapped_transformer = accelerator.unwrap_model(transformer)
         cast(Flux2Transformer2DModel, unwrapped_transformer).save_lora_adapter(
@@ -302,20 +258,7 @@ class Flux2PairedEditLoraTrainer:
             adapter_name="default",
             safe_serialization=True,
         )
-        manifest = {
-            "model_key": self.model_key,
-            "model_id": str(self.model_cfg.pretrained_model_name_or_path),
-            "trainer": str(self.model_cfg.trainer),
-            "step": step,
-            "requires_source_image": True,
-            "conditioning": "source_latents_concatenated_to_noisy_target_latents",
-            "lora_rank": int(self.cfg.training.rank),
-            "lora_alpha": int(self.cfg.training.lora_alpha),
-            "dataset_train_dir": str(self.cfg.dataset.train_dir),
-            "hf_endpoint": os.environ.get("HF_ENDPOINT", ""),
-        }
-        with (save_dir / "training_manifest.json").open("w", encoding="utf-8") as handle:
-            json.dump(manifest, handle, indent=2)
+        write_training_manifest(save_dir, self.cfg, self.model_key, self.model_cfg, step)
         return save_dir
 
 
@@ -339,26 +282,15 @@ def load_flux2_pipeline(
         str(model_cfg.pretrained_model_name_or_path),
         **load_kwargs,
     )
-    cast(Any, pipe.transformer).load_lora_adapter(
+    transformer = cast(Any, pipe.transformer)
+    transformer.load_lora_adapter(
         str(checkpoint_dir),
         prefix=None,
         weight_name="pytorch_lora_weights.safetensors",
         adapter_name="aura",
     )
-    cast(Any, pipe.transformer).set_adapters(["aura"], weights=[float(cfg.evaluation.lora_scale)])
+    transformer.set_adapters(["aura"], weights=[float(cfg.evaluation.lora_scale)])
     return pipe
-
-
-def load_flux2_condition_image(path: Path, width: int, height: int) -> PILImage:
-    image = load_rgb_image(path)
-    return cast(
-        PILImage,
-        ImageOps.fit(
-            image,
-            (width, height),
-            method=Image.Resampling.LANCZOS,
-        ),
-    )
 
 
 def run_flux2_batch(
@@ -376,7 +308,7 @@ def run_flux2_batch(
         height = int(cfg.evaluation.height)
         call_kwargs: dict[str, Any] = {
             "prompt": str(cfg.evaluation.prompt),
-            "image": load_flux2_condition_image(input_path, width, height),
+            "image": load_condition_image(input_path, width, height),
             "height": height,
             "width": width,
             "num_inference_steps": int(cfg.evaluation.num_inference_steps),

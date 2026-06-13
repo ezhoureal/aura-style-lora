@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import random
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol, cast
+from collections.abc import Iterable
+from typing import Any, Protocol, TypeVar, cast
 
 import torch
+from accelerate import Accelerator
+from accelerate.utils import ProjectConfiguration, set_seed
+from diffusers.optimization import get_scheduler
 from omegaconf import DictConfig, ListConfig, OmegaConf
 from PIL import Image, ImageOps
 from PIL.Image import Image as PILImage
@@ -16,6 +21,8 @@ from peft import set_peft_model_state_dict
 from safetensors.torch import load_file
 from torch import nn
 from torch import Tensor
+from torch.optim import Optimizer
+from torch.optim.lr_scheduler import LRScheduler
 from torch.utils.data import Dataset
 from torchvision import transforms
 from tqdm.auto import tqdm
@@ -25,6 +32,8 @@ from tqdm.std import tqdm as Tqdm
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SUPPORTED_IMAGE_SUFFIXES = {".avif", ".bmp", ".jpeg", ".jpg", ".png", ".webp"}
 CHECKPOINT_DIR_PATTERN = re.compile(r"^checkpoint-(?P<step>\d+)$")
+BatchT = TypeVar("BatchT")
+LossBatchT = TypeVar("LossBatchT", contravariant=True)
 
 
 @dataclass(frozen=True)
@@ -38,6 +47,13 @@ class PairExample:
 class ResumeCheckpoint:
     path: Path
     step: int
+
+
+@dataclass(frozen=True)
+class TrainingPlan:
+    initial_step: int
+    remaining_steps: int
+    num_train_epochs: int
 
 
 @dataclass(frozen=True)
@@ -56,6 +72,14 @@ class ProgressAccelerator(Protocol):
     def is_local_main_process(self) -> bool: ...
 
 
+class CheckpointWriter(Protocol):
+    def __call__(self, step: int) -> Path: ...
+
+
+class LossStep(Protocol[LossBatchT]):
+    def __call__(self, batch: LossBatchT) -> Tensor: ...
+
+
 def make_training_progress(
     accelerator: ProgressAccelerator, total_steps: int, initial_step: int, description: str
 ) -> Tqdm:
@@ -72,6 +96,18 @@ def load_rgb_image(path: Path) -> PILImage:
     with Image.open(path) as image:
         transposed = cast(PILImage, ImageOps.exif_transpose(image))
         return transposed.convert("RGB")
+
+
+def load_condition_image(path: Path, width: int, height: int) -> PILImage:
+    image = load_rgb_image(path)
+    return cast(
+        PILImage,
+        ImageOps.fit(
+            image,
+            (width, height),
+            method=Image.Resampling.LANCZOS,
+        ),
+    )
 
 
 def make_pair_image_transform(resolution: int, center_crop: bool) -> transforms.Compose:
@@ -173,6 +209,10 @@ def latest_checkpoint(output_dir: Path) -> ResumeCheckpoint | None:
     return max(checkpoints, key=lambda checkpoint: checkpoint.step)
 
 
+def checkpoint_dir_for_step(output_dir: Path, step: int) -> Path:
+    return output_dir / f"checkpoint-{step:06d}"
+
+
 def resolve_repo_path(value: str) -> Path:
     path = Path(value).expanduser()
     if path.is_absolute():
@@ -263,6 +303,133 @@ def freeze_module(module: nn.Module) -> None:
 
 def trainable_parameters(module: nn.Module) -> list[nn.Parameter]:
     return [parameter for parameter in module.parameters() if parameter.requires_grad]
+
+
+def trainer_output_dir(cfg: DictConfig, model_key: str) -> Path:
+    return resolve_repo_path(str(cfg.training.output_root)) / model_key
+
+
+def make_accelerator(training_cfg: DictConfig, output_dir: Path) -> Accelerator:
+    logging_dir = output_dir / "logs"
+    return Accelerator(
+        gradient_accumulation_steps=int(training_cfg.gradient_accumulation_steps),
+        mixed_precision=str(training_cfg.mixed_precision),
+        project_config=ProjectConfiguration(
+            project_dir=str(output_dir),
+            logging_dir=str(logging_dir),
+        ),
+    )
+
+
+def configure_training_runtime(training_cfg: DictConfig) -> None:
+    set_seed(int(training_cfg.seed))
+    if bool(training_cfg.allow_tf32):
+        torch.backends.cuda.matmul.allow_tf32 = True
+
+
+def make_optimizer(module: nn.Module, training_cfg: DictConfig) -> Optimizer:
+    return torch.optim.AdamW(trainable_parameters(module), lr=float(training_cfg.learning_rate))
+
+
+def make_training_plan(
+    dataloader_len: int,
+    training_cfg: DictConfig,
+    resume_checkpoint: ResumeCheckpoint | None,
+) -> TrainingPlan:
+    updates_per_epoch = math.ceil(dataloader_len / int(training_cfg.gradient_accumulation_steps))
+    initial_step = 0 if resume_checkpoint is None else resume_checkpoint.step
+    remaining_steps = int(training_cfg.max_train_steps) - initial_step
+    if remaining_steps <= 0:
+        return TrainingPlan(
+            initial_step=initial_step,
+            remaining_steps=remaining_steps,
+            num_train_epochs=0,
+        )
+    return TrainingPlan(
+        initial_step=initial_step,
+        remaining_steps=remaining_steps,
+        num_train_epochs=math.ceil(remaining_steps / updates_per_epoch),
+    )
+
+
+def make_lr_scheduler(training_cfg: DictConfig, optimizer: Optimizer) -> LRScheduler:
+    return get_scheduler(
+        str(training_cfg.lr_scheduler),
+        optimizer=optimizer,
+        num_warmup_steps=int(training_cfg.lr_warmup_steps)
+        * int(training_cfg.gradient_accumulation_steps),
+        num_training_steps=int(training_cfg.max_train_steps)
+        * int(training_cfg.gradient_accumulation_steps),
+    )
+
+
+def run_training_loop(
+    accelerator: Accelerator,
+    train_model: nn.Module,
+    dataloader: Iterable[BatchT],
+    optimizer: Optimizer,
+    lr_scheduler: LRScheduler,
+    training_cfg: DictConfig,
+    model_key: str,
+    plan: TrainingPlan,
+    loss_step: LossStep[BatchT],
+    write_checkpoint: CheckpointWriter,
+) -> int:
+    global_step = plan.initial_step
+    with make_training_progress(
+        accelerator,
+        int(training_cfg.max_train_steps),
+        global_step,
+        f"Training {model_key}",
+    ) as progress:
+        for _epoch in range(plan.num_train_epochs):
+            for batch in dataloader:
+                with accelerator.accumulate(train_model):
+                    loss = loss_step(batch)
+                    accelerator.backward(loss)
+                    if accelerator.sync_gradients:
+                        accelerator.clip_grad_norm_(
+                            trainable_parameters(train_model),
+                            float(training_cfg.max_grad_norm),
+                        )
+                    optimizer.step()
+                    lr_scheduler.step()
+                    optimizer.zero_grad(set_to_none=True)
+
+                if accelerator.sync_gradients:
+                    global_step += 1
+                    progress.update(1)
+                    progress.set_postfix(loss=f"{float(loss.detach()):.4f}")
+                    if global_step % int(training_cfg.checkpointing_steps) == 0:
+                        write_checkpoint(global_step)
+                    if global_step >= int(training_cfg.max_train_steps):
+                        break
+            if global_step >= int(training_cfg.max_train_steps):
+                break
+    return global_step
+
+
+def write_training_manifest(
+    save_dir: Path,
+    cfg: DictConfig,
+    model_key: str,
+    model_cfg: DictConfig,
+    step: int,
+) -> None:
+    manifest = {
+        "model_key": model_key,
+        "model_id": str(model_cfg.pretrained_model_name_or_path),
+        "trainer": str(model_cfg.trainer),
+        "step": step,
+        "requires_source_image": True,
+        "conditioning": "source_latents_concatenated_to_noisy_target_latents",
+        "lora_rank": int(cfg.training.rank),
+        "lora_alpha": int(cfg.training.lora_alpha),
+        "dataset_train_dir": str(cfg.dataset.train_dir),
+        "hf_endpoint": os.environ.get("HF_ENDPOINT", ""),
+    }
+    with (save_dir / "training_manifest.json").open("w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, indent=2)
 
 
 def dtype_from_precision(value: str) -> torch.dtype:

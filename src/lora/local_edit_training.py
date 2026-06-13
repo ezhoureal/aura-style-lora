@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 from hydra import compose, initialize_config_dir
@@ -67,16 +68,21 @@ class UnsupportedLocalEditTrainer:
         raise NotImplementedError(f"{display_name}: {note}")
 
 
+TrainerFactory = Callable[[DictConfig, str], EditTrainer]
+
+TRAINER_FACTORIES: dict[str, TrainerFactory] = {
+    "stable_diffusion_ip2p_lora": StableDiffusionIp2PLoraTrainer,
+    "stable_diffusion_3_paired_edit_lora": StableDiffusion3PairedEditLoraTrainer,
+    "flux2_paired_edit_lora": Flux2PairedEditLoraTrainer,
+    "unsupported_local_edit": UnsupportedLocalEditTrainer,
+}
+
+
 def make_trainer(cfg: DictConfig, model_key: str) -> EditTrainer:
     trainer_name = str(cfg.models[model_key].trainer)
-    if trainer_name == "stable_diffusion_ip2p_lora":
-        return StableDiffusionIp2PLoraTrainer(cfg, model_key)
-    if trainer_name == "stable_diffusion_3_paired_edit_lora":
-        return StableDiffusion3PairedEditLoraTrainer(cfg, model_key)
-    if trainer_name == "flux2_paired_edit_lora":
-        return Flux2PairedEditLoraTrainer(cfg, model_key)
-    if trainer_name == "unsupported_local_edit":
-        return UnsupportedLocalEditTrainer(cfg, model_key)
+    trainer_factory = TRAINER_FACTORIES.get(trainer_name)
+    if trainer_factory is not None:
+        return trainer_factory(cfg, model_key)
     raise ValueError(f"Unknown trainer adapter: {trainer_name}")
 
 
@@ -109,6 +115,8 @@ __all__ = [
     "SD3PreparedBatch",
     "StableDiffusionIp2PLoraTrainer",
     "StableDiffusion3PairedEditLoraTrainer",
+    "TRAINER_FACTORIES",
+    "TrainerFactory",
     "UnsupportedLocalEditTrainer",
     "apply_lora_checkpoint",
     "apply_sd3_input_projection_patch",
