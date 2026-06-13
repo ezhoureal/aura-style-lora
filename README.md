@@ -5,7 +5,7 @@ photorealistic source image plus a target image in the desired style, and the mo
 to transfer style while preserving identity, composition, pose, silhouette, camera framing,
 and important details.
 
-The active local target is `flux2_klein_base`, a FLUX.2 Klein/Base 4B paired-edit LoRA.
+The active local target is `sd35_medium`, a Stable Diffusion 3.5 Medium paired-edit LoRA.
 Hydra config lives in `configs/local_edit_lora.yaml`; avoid ad hoc CLI argument drift by
 updating that YAML when changing training or eval settings.
 
@@ -17,9 +17,8 @@ updating that YAML when changing training or eval settings.
   trainer, LoRA loading, and inference.
 - `src/lora/local_edit_sd.py`: Stable Diffusion InstructPix2Pix dataset, trainer, UNet
   input-channel patching, and inference.
-- `src/lora/local_edit_sd3.py`: Stable Diffusion 3.5 paired-edit trainer scaffold,
-  transformer input-projection patching, and LoRA checkpoint plumbing. The core
-  `training_step` is intentionally left as a TODO.
+- `src/lora/local_edit_sd3.py`: Stable Diffusion 3.5 paired-edit dataset wiring,
+  transformer input-projection patching, LoRA checkpoint plumbing, training, and inference.
 - `src/lora/local_edit_training.py`: Hydra training entrypoint and trainer dispatch.
 - `src/lora/local_edit_inference.py`: Hydra inference entrypoint and model dispatch.
 - `scripts/train_local_edit_lora.py`: local Hydra training wrapper.
@@ -39,9 +38,9 @@ Check the GPU before training or eval:
 nvidia-smi
 ```
 
-The current config is tuned for a single RTX 4090-class GPU with BF16. Training minimizes
-VRAM by freezing non-LoRA modules, caching prompt embeddings, and moving the text encoder
-off GPU after cache construction.
+The current config is tuned for a single RTX 4090-class GPU with BF16. SD3.5 training
+minimizes VRAM by freezing non-LoRA modules, building prompt embeddings on GPU while the
+transformer is still off GPU, then moving text encoders back to CPU before the training loop.
 
 ## Train
 
@@ -57,7 +56,7 @@ Useful reproducible overrides for a smoke run:
 uv run scripts/train_local_edit_lora.py \
   training.max_train_steps=1 \
   training.checkpointing_steps=1 \
-  training.output_root=outputs/smoke/flux2_local_edit_lora
+  training.output_root=outputs/smoke/sd3_local_edit_lora
 ```
 
 ## Evaluate
@@ -76,15 +75,13 @@ ${training.output_root}/${model_key}/checkpoint-${training.max_train_steps}
 Eval outputs are written to:
 
 ```text
-outputs/ablation/local_edit_eval/flux2_klein_base
+outputs/ablation/local_edit_eval/sd35_medium
 ```
 
 ## Notes
 
-- `selected_models` currently contains only `flux2_klein_base`.
-- SD 1.5 and SD 2.1 trainer code remains in the repo, but the active paired Flux2 path is
-  the one currently configured.
-- SD3.5 local paired-edit support is scaffolded in config, but its core train step is
-  intentionally unimplemented.
-- The eval code resizes/crops each Flux2 conditioning image to the configured eval canvas
-  before inference, matching the training resolution by default and keeping VRAM predictable.
+- `selected_models` currently contains only `sd35_medium`.
+- SD 1.5, SD 2.1, and FLUX.2 trainer code remains in the repo, but the active paired SD3.5
+  path is the one currently configured.
+- SD3.5 eval resizes/crops each conditioning image to the configured eval canvas before
+  inference, matching the training resolution by default and keeping VRAM predictable.

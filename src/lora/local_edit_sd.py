@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import math
 import os
-import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -20,13 +19,11 @@ from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_instruct_pix
 )
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from omegaconf import DictConfig
-from PIL import Image
 from PIL.Image import Image as PILImage
 from peft import LoraConfig
 from safetensors.torch import load_file, save_file
 from torch import Tensor, nn
 from torch.utils.data import DataLoader, Dataset
-from torchvision import transforms
 from transformers import CLIPTextModel, CLIPTokenizer
 
 from lora.local_edit_common import (
@@ -38,6 +35,8 @@ from lora.local_edit_common import (
     generators_for_batch,
     load_pair_examples,
     load_rgb_image,
+    load_transformed_pair,
+    make_pair_image_transform,
     make_training_progress,
     none_if_null,
     resolve_resume_checkpoint,
@@ -64,17 +63,7 @@ class PairedEditDataset(Dataset[PreparedBatch]):
     ) -> None:
         self.examples = examples
         self.tokenizer = tokenizer
-        crop: transforms.CenterCrop | transforms.RandomCrop
-        crop = (
-            transforms.CenterCrop(resolution) if center_crop else transforms.RandomCrop(resolution)
-        )
-        transform_steps: list[Any] = [
-            transforms.Resize(resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-            crop,
-            transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5]),
-        ]
-        self.image_transform = transforms.Compose(transform_steps)
+        self.image_transform = make_pair_image_transform(resolution, center_crop)
         self.random_flip = random_flip
 
     def __len__(self) -> int:
@@ -82,11 +71,11 @@ class PairedEditDataset(Dataset[PreparedBatch]):
 
     def __getitem__(self, index: int) -> PreparedBatch:
         example = self.examples[index]
-        source_image = load_rgb_image(example.source_path)
-        target_image = load_rgb_image(example.target_path)
-        if self.random_flip and random.random() < 0.5:
-            source_image = source_image.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
-            target_image = target_image.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+        source_pixels, target_pixels = load_transformed_pair(
+            example,
+            self.image_transform,
+            self.random_flip,
+        )
 
         tokens = self.tokenizer(
             example.prompt,
@@ -96,8 +85,8 @@ class PairedEditDataset(Dataset[PreparedBatch]):
             return_tensors="pt",
         )
         return PreparedBatch(
-            source_pixels=cast(Tensor, self.image_transform(source_image)),
-            target_pixels=cast(Tensor, self.image_transform(target_image)),
+            source_pixels=source_pixels,
+            target_pixels=target_pixels,
             input_ids=cast(Tensor, tokens.input_ids[0]),
         )
 

@@ -27,6 +27,7 @@ from lora.local_edit_training import (
     make_trainer,
     resolve_resume_checkpoint,
 )
+from lora.local_edit_sd3 import SD3PreparedBatch, SD3PromptEmbeds
 
 
 class TinyConfig:
@@ -71,6 +72,81 @@ class TinyLoraTarget(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.to_q = nn.Linear(2, 2, bias=False)
+
+
+class FakeAccelerator:
+    device = torch.device("cpu")
+
+
+class FakeVaeConfig:
+    scaling_factor = 1.0
+    shift_factor = 0.0
+
+
+class FakeLatentDist:
+    def __init__(self, latents: torch.Tensor) -> None:
+        self.latents = latents
+
+    def sample(self) -> torch.Tensor:
+        return self.latents
+
+    def mode(self) -> torch.Tensor:
+        return self.latents
+
+
+class FakeEncoded:
+    def __init__(self, latents: torch.Tensor) -> None:
+        self.latent_dist = FakeLatentDist(latents)
+
+
+class FakeVae:
+    config = FakeVaeConfig()
+
+    def encode(self, pixels: torch.Tensor) -> FakeEncoded:
+        latent_value = 2.0 if float(pixels.mean()) < 2.0 else 5.0
+        latents = torch.full((pixels.shape[0], 16, 1, 1), latent_value, dtype=pixels.dtype)
+        return FakeEncoded(latents)
+
+
+class FakeSchedulerConfig:
+    num_train_timesteps = 1
+
+
+class FakeScheduler:
+    config = FakeSchedulerConfig()
+
+    def __init__(self) -> None:
+        self.timesteps = torch.tensor([250.0])
+        self.sigmas = torch.tensor([0.25])
+
+
+class FakePipe:
+    def __init__(self) -> None:
+        self.vae = FakeVae()
+        self.scheduler = FakeScheduler()
+
+
+class CapturingTransformer(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.hidden_states: torch.Tensor | None = None
+        self.timestep: torch.Tensor | None = None
+        self.encoder_hidden_states: torch.Tensor | None = None
+        self.pooled_projections: torch.Tensor | None = None
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        pooled_projections: torch.Tensor,
+        return_dict: bool,
+    ) -> tuple[torch.Tensor]:
+        self.hidden_states = hidden_states
+        self.timestep = timestep
+        self.encoder_hidden_states = encoder_hidden_states
+        self.pooled_projections = pooled_projections
+        return (torch.full((hidden_states.shape[0], 16, 1, 1), 5.0),)
 
 
 class DatasetTests(unittest.TestCase):
@@ -163,6 +239,60 @@ class FlowMatchTests(unittest.TestCase):
 
         self.assertTrue(torch.equal(noisy, torch.tensor([[[1.5, 3.0]]])))
         self.assertTrue(torch.equal(target, torch.tensor([[[2.0, 4.0]]])))
+
+
+class SD3TrainingStepTests(unittest.TestCase):
+    def test_training_step_uses_noisy_target_then_source_conditioning(self) -> None:
+        cfg = OmegaConf.create(
+            {
+                "training": {"output_root": "outputs/test"},
+                "models": {
+                    "sd35": {
+                        "trainer": "stable_diffusion_3_paired_edit_lora",
+                        "pretrained_model_name_or_path": "stabilityai/stable-diffusion-3.5-medium",
+                    }
+                },
+            }
+        )
+        trainer = StableDiffusion3PairedEditLoraTrainer(cfg, "sd35")
+        transformer = CapturingTransformer()
+        batch = SD3PreparedBatch(
+            source_pixels=torch.full((1, 3, 2, 2), 3.0),
+            target_pixels=torch.full((1, 3, 2, 2), 1.0),
+            prompts=["edit"],
+        )
+        prompt_cache = {
+            "edit": SD3PromptEmbeds(
+                prompt_embeds=torch.full((1, 2, 4), 11.0),
+                pooled_prompt_embeds=torch.full((1, 4), 13.0),
+            )
+        }
+
+        with unittest.mock.patch(
+            "torch.randn_like",
+            return_value=torch.full((1, 16, 1, 1), 7.0),
+        ):
+            loss = trainer.training_step(
+                accelerator=FakeAccelerator(),  # type: ignore[arg-type]
+                batch=batch,
+                pipe=FakePipe(),
+                transformer=transformer,
+                prompt_cache=prompt_cache,
+                weight_dtype=torch.float32,
+            )
+
+        self.assertEqual(float(loss), 0.0)
+        self.assertIsNotNone(transformer.hidden_states)
+        assert transformer.hidden_states is not None
+        self.assertTrue(
+            torch.equal(transformer.hidden_states[:, :16], torch.full((1, 16, 1, 1), 3.25))
+        )
+        self.assertTrue(
+            torch.equal(transformer.hidden_states[:, 16:], torch.full((1, 16, 1, 1), 5.0))
+        )
+        self.assertTrue(torch.equal(transformer.timestep, torch.tensor([250.0])))
+        self.assertTrue(torch.equal(transformer.encoder_hidden_states, torch.full((1, 2, 4), 11.0)))
+        self.assertTrue(torch.equal(transformer.pooled_projections, torch.full((1, 4), 13.0)))
 
 
 class ProgressTests(unittest.TestCase):

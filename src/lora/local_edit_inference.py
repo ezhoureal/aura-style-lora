@@ -28,6 +28,7 @@ from lora.local_edit_common import (
 )
 from lora.local_edit_flux2 import load_flux2_pipeline, run_flux2_batch
 from lora.local_edit_sd import load_sd_pipeline, run_sd_batch
+from lora.local_edit_sd3 import load_sd3_pipeline, run_sd3_batch
 
 
 def checkpoint_dir_for_model(cfg: DictConfig, model_key: str) -> Path:
@@ -43,6 +44,8 @@ def load_pipeline(cfg: DictConfig, model_key: str, checkpoint_dir: Path) -> Any:
     trainer = str(model_cfg.trainer)
     if trainer == "stable_diffusion_ip2p_lora":
         return load_sd_pipeline(cfg, model_key, checkpoint_dir)
+    if trainer == "stable_diffusion_3_paired_edit_lora":
+        return load_sd3_pipeline(cfg, model_key, checkpoint_dir)
     if trainer == "flux2_paired_edit_lora":
         return load_flux2_pipeline(cfg, model_key, checkpoint_dir)
     raise NotImplementedError(f"Local inference is not implemented for trainer {trainer}")
@@ -67,6 +70,10 @@ def run_batch(
         )
     if trainer == "flux2_paired_edit_lora":
         return run_flux2_batch(
+            cast(DiffusionPipeline, pipe), cfg, input_paths, device_name, batch_offset
+        )
+    if trainer == "stable_diffusion_3_paired_edit_lora":
+        return run_sd3_batch(
             cast(DiffusionPipeline, pipe), cfg, input_paths, device_name, batch_offset
         )
     raise NotImplementedError(f"Local inference is not implemented for trainer {trainer}")
@@ -137,10 +144,12 @@ __all__ = [
     "load_flux2_pipeline",
     "load_pipeline",
     "load_rgb_image",
+    "load_sd3_pipeline",
     "load_sd_pipeline",
     "run",
     "run_batch",
     "run_flux2_batch",
     "run_model",
+    "run_sd3_batch",
     "run_sd_batch",
 ]

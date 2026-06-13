@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,6 +15,9 @@ from PIL.Image import Image as PILImage
 from peft import set_peft_model_state_dict
 from safetensors.torch import load_file
 from torch import nn
+from torch import Tensor
+from torch.utils.data import Dataset
+from torchvision import transforms
 from tqdm.auto import tqdm
 from tqdm.std import tqdm as Tqdm
 
@@ -34,6 +38,13 @@ class PairExample:
 class ResumeCheckpoint:
     path: Path
     step: int
+
+
+@dataclass(frozen=True)
+class PairedPromptBatch:
+    source_pixels: Tensor
+    target_pixels: Tensor
+    prompts: list[str]
 
 
 class EditTrainer(Protocol):
@@ -61,6 +72,71 @@ def load_rgb_image(path: Path) -> PILImage:
     with Image.open(path) as image:
         transposed = cast(PILImage, ImageOps.exif_transpose(image))
         return transposed.convert("RGB")
+
+
+def make_pair_image_transform(resolution: int, center_crop: bool) -> transforms.Compose:
+    crop: transforms.CenterCrop | transforms.RandomCrop
+    crop = transforms.CenterCrop(resolution) if center_crop else transforms.RandomCrop(resolution)
+    transform_steps: list[Any] = [
+        transforms.Resize(resolution, interpolation=transforms.InterpolationMode.BILINEAR),
+        crop,
+        transforms.ToTensor(),
+        transforms.Normalize([0.5], [0.5]),
+    ]
+    return transforms.Compose(transform_steps)
+
+
+def load_transformed_pair(
+    example: PairExample,
+    image_transform: transforms.Compose,
+    random_flip: bool,
+) -> tuple[Tensor, Tensor]:
+    source_image = load_rgb_image(example.source_path)
+    target_image = load_rgb_image(example.target_path)
+    if random_flip and random.random() < 0.5:
+        source_image = source_image.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+        target_image = target_image.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+    return (
+        cast(Tensor, image_transform(source_image)),
+        cast(Tensor, image_transform(target_image)),
+    )
+
+
+class PairedPromptDataset(Dataset[PairedPromptBatch]):
+    def __init__(
+        self,
+        examples: list[PairExample],
+        resolution: int,
+        center_crop: bool,
+        random_flip: bool,
+    ) -> None:
+        self.examples = examples
+        self.image_transform = make_pair_image_transform(resolution, center_crop)
+        self.random_flip = random_flip
+
+    def __len__(self) -> int:
+        return len(self.examples)
+
+    def __getitem__(self, index: int) -> PairedPromptBatch:
+        example = self.examples[index]
+        source_pixels, target_pixels = load_transformed_pair(
+            example,
+            self.image_transform,
+            self.random_flip,
+        )
+        return PairedPromptBatch(
+            source_pixels=source_pixels,
+            target_pixels=target_pixels,
+            prompts=[example.prompt],
+        )
+
+
+def collate_paired_prompt_batches(items: list[PairedPromptBatch]) -> PairedPromptBatch:
+    return PairedPromptBatch(
+        source_pixels=torch.stack([item.source_pixels for item in items]),
+        target_pixels=torch.stack([item.target_pixels for item in items]),
+        prompts=[item.prompts[0] for item in items],
+    )
 
 
 def read_metadata(path: Path) -> list[dict[str, Any]]:

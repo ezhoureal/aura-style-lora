@@ -3,28 +3,35 @@ from __future__ import annotations
 import json
 import math
 import os
-import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
 import torch
+import torch.nn.functional as F
 from accelerate import Accelerator
 from accelerate.utils import ProjectConfiguration, set_seed
 from diffusers.optimization import get_scheduler
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
+from diffusers.pipelines.stable_diffusion_3.pipeline_stable_diffusion_3 import (
+    calculate_shift,
+    retrieve_timesteps,
+)
 from omegaconf import DictConfig
-from PIL import Image
+from PIL import Image, ImageOps
+from PIL.Image import Image as PILImage
 from peft import LoraConfig
 from safetensors.torch import load_file, save_file
 from torch import Tensor, nn
-from torch.utils.data import DataLoader, Dataset
-from torchvision import transforms
+from torch.utils.data import DataLoader
 
 from lora.local_edit_common import (
-    PairExample,
+    PairedPromptBatch,
+    PairedPromptDataset,
     apply_lora_checkpoint,
+    collate_paired_prompt_batches,
     dtype_from_precision,
+    evaluation_seed,
     freeze_module,
     load_pair_examples,
     load_rgb_image,
@@ -36,64 +43,15 @@ from lora.local_edit_common import (
 )
 
 
-@dataclass(frozen=True)
-class SD3PreparedBatch:
-    source_pixels: Tensor
-    target_pixels: Tensor
-    prompts: list[str]
+SD3PreparedBatch = PairedPromptBatch
+SD3PairedEditDataset = PairedPromptDataset
+collate_sd3_batches = collate_paired_prompt_batches
 
 
 @dataclass(frozen=True)
 class SD3PromptEmbeds:
     prompt_embeds: Tensor
     pooled_prompt_embeds: Tensor
-
-
-class SD3PairedEditDataset(Dataset[SD3PreparedBatch]):
-    def __init__(
-        self,
-        examples: list[PairExample],
-        resolution: int,
-        center_crop: bool,
-        random_flip: bool,
-    ) -> None:
-        self.examples = examples
-        crop: transforms.CenterCrop | transforms.RandomCrop
-        crop = (
-            transforms.CenterCrop(resolution) if center_crop else transforms.RandomCrop(resolution)
-        )
-        transform_steps: list[Any] = [
-            transforms.Resize(resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-            crop,
-            transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5]),
-        ]
-        self.image_transform = transforms.Compose(transform_steps)
-        self.random_flip = random_flip
-
-    def __len__(self) -> int:
-        return len(self.examples)
-
-    def __getitem__(self, index: int) -> SD3PreparedBatch:
-        example = self.examples[index]
-        source_image = load_rgb_image(example.source_path)
-        target_image = load_rgb_image(example.target_path)
-        if self.random_flip and random.random() < 0.5:
-            source_image = source_image.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
-            target_image = target_image.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
-        return SD3PreparedBatch(
-            source_pixels=cast(Tensor, self.image_transform(source_image)),
-            target_pixels=cast(Tensor, self.image_transform(target_image)),
-            prompts=[example.prompt],
-        )
-
-
-def collate_sd3_batches(items: list[SD3PreparedBatch]) -> SD3PreparedBatch:
-    return SD3PreparedBatch(
-        source_pixels=torch.stack([item.source_pixels for item in items]),
-        target_pixels=torch.stack([item.target_pixels for item in items]),
-        prompts=[item.prompts[0] for item in items],
-    )
 
 
 def expand_sd3_transformer_input_for_paired_edit(transformer: nn.Module) -> None:
@@ -168,6 +126,9 @@ class StableDiffusion3PairedEditLoraTrainer:
             "low_cpu_mem_usage": True,
             "local_files_only": bool(training_cfg.get("local_files_only", False)),
         }
+        if bool(training_cfg.get("sd3_disable_t5", False)):
+            load_kwargs["text_encoder_3"] = None
+            load_kwargs["tokenizer_3"] = None
         revision = none_if_null(self.model_cfg.get("revision"))
         variant = none_if_null(self.model_cfg.get("variant"))
         if revision is not None:
@@ -179,12 +140,14 @@ class StableDiffusion3PairedEditLoraTrainer:
         freeze_module(pipe.vae)
         freeze_module(pipe.text_encoder)
         freeze_module(pipe.text_encoder_2)
-        freeze_module(pipe.text_encoder_3)
+        if pipe.text_encoder_3 is not None:
+            freeze_module(pipe.text_encoder_3)
         freeze_module(pipe.transformer)
         pipe.vae.eval()
         pipe.text_encoder.eval()
         pipe.text_encoder_2.eval()
-        pipe.text_encoder_3.eval()
+        if pipe.text_encoder_3 is not None:
+            pipe.text_encoder_3.eval()
 
         expand_sd3_transformer_input_for_paired_edit(cast(nn.Module, pipe.transformer))
         pipe.transformer.train()
@@ -313,7 +276,8 @@ class StableDiffusion3PairedEditLoraTrainer:
         batch_size = int(self.cfg.training.get("prompt_embed_batch_size", 1))
         pipe.text_encoder.to(device=device, dtype=weight_dtype)
         pipe.text_encoder_2.to(device=device, dtype=weight_dtype)
-        pipe.text_encoder_3.to(device=device, dtype=weight_dtype)
+        if pipe.text_encoder_3 is not None:
+            pipe.text_encoder_3.to(device=device, dtype=weight_dtype)
         with torch.no_grad():
             for start in range(0, len(prompts), batch_size):
                 prompt_batch = prompts[start : start + batch_size]
@@ -335,7 +299,8 @@ class StableDiffusion3PairedEditLoraTrainer:
     def offload_text_encoders(self, pipe: Any) -> None:
         pipe.text_encoder.to("cpu")
         pipe.text_encoder_2.to("cpu")
-        pipe.text_encoder_3.to("cpu")
+        if pipe.text_encoder_3 is not None:
+            pipe.text_encoder_3.to("cpu")
 
     def training_step(
         self,
@@ -348,15 +313,59 @@ class StableDiffusion3PairedEditLoraTrainer:
     ) -> Tensor:
         target_pixels = batch.target_pixels.to(accelerator.device, dtype=weight_dtype)
         source_pixels = batch.source_pixels.to(accelerator.device, dtype=weight_dtype)
-        input_ids = batch.input_ids.to(accelerator.device)
-        
-        target_encode = self.encode(target_pixels)
-        noisy_latent = (1 - sigma) * target_encode + sigma * noise
-        source_encode = self.encode(source_pixels)
-        input = torch.concat([source_encode, target_encode], dim=1)
-        timestamp = torch.rand(0, 1)
-        pred = pipe(input, noisy_latent, timestamp)
-        return mse.loss(target_encode - pred, target_encode)
+
+        with torch.no_grad():
+            target_encoded = cast(Any, pipe.vae.encode(target_pixels))
+            target_latents = cast(Tensor, target_encoded.latent_dist.sample())
+            source_encoded = cast(Any, pipe.vae.encode(source_pixels))
+            source_latents = cast(Tensor, source_encoded.latent_dist.mode())
+
+        vae_config = cast(Any, pipe.vae.config)
+        scaling_factor = float(vae_config.scaling_factor)
+        shift_factor = float(vae_config.shift_factor)
+        target_latents = (target_latents - shift_factor) * scaling_factor
+        source_latents = (source_latents - shift_factor) * scaling_factor
+        target_latents = target_latents.to(accelerator.device, dtype=weight_dtype)
+        source_latents = source_latents.to(accelerator.device, dtype=weight_dtype)
+
+        noise = torch.randn_like(target_latents)
+        batch_size = target_latents.shape[0]
+        scheduler = cast(Any, pipe.scheduler)
+        timestep_indices = torch.randint(
+            0,
+            int(scheduler.config.num_train_timesteps),
+            (batch_size,),
+            device=accelerator.device,
+        )
+        timesteps = scheduler.timesteps.to(accelerator.device)[timestep_indices]
+        sigmas = scheduler.sigmas.to(accelerator.device, dtype=target_latents.dtype)[
+            timestep_indices
+        ]
+        while sigmas.ndim < target_latents.ndim:
+            sigmas = sigmas.unsqueeze(-1)
+
+        noisy_target_latents = (1.0 - sigmas) * target_latents + sigmas * noise
+        model_input = torch.cat([noisy_target_latents, source_latents], dim=1)
+
+        prompt_embeds = torch.cat(
+            [prompt_cache[prompt].prompt_embeds for prompt in batch.prompts], dim=0
+        ).to(accelerator.device, dtype=weight_dtype)
+        pooled_prompt_embeds = torch.cat(
+            [prompt_cache[prompt].pooled_prompt_embeds for prompt in batch.prompts], dim=0
+        ).to(accelerator.device, dtype=weight_dtype)
+
+        model_pred = cast(
+            tuple[Tensor],
+            cast(Any, transformer)(
+                hidden_states=model_input,
+                timestep=timesteps,
+                encoder_hidden_states=prompt_embeds,
+                pooled_projections=pooled_prompt_embeds,
+                return_dict=False,
+            ),
+        )[0]
+        target = noise - target_latents
+        return cast(Tensor, F.mse_loss(model_pred.float(), target.float(), reduction="mean"))
 
     def save(self, accelerator: Accelerator, transformer: nn.Module, step: int) -> Path:
         if not accelerator.is_main_process:
@@ -397,3 +406,209 @@ class StableDiffusion3PairedEditLoraTrainer:
         with (save_dir / "training_manifest.json").open("w", encoding="utf-8") as handle:
             json.dump(manifest, handle, indent=2)
         return save_dir
+
+
+def load_sd3_pipeline(
+    cfg: DictConfig,
+    model_key: str,
+    checkpoint_dir: Path,
+) -> DiffusionPipeline:
+    model_cfg = cfg.models[model_key]
+    dtype = dtype_from_precision(str(cfg.evaluation.mixed_precision))
+    load_kwargs: dict[str, Any] = {
+        "torch_dtype": dtype,
+        "low_cpu_mem_usage": True,
+        "local_files_only": bool(cfg.evaluation.get("local_files_only", False)),
+    }
+    if bool(cfg.evaluation.get("sd3_disable_t5", False)):
+        load_kwargs["text_encoder_3"] = None
+        load_kwargs["tokenizer_3"] = None
+    revision = none_if_null(model_cfg.get("revision"))
+    variant = none_if_null(model_cfg.get("variant"))
+    if revision is not None:
+        load_kwargs["revision"] = revision
+    if variant is not None:
+        load_kwargs["variant"] = variant
+    pipe = DiffusionPipeline.from_pretrained(
+        str(model_cfg.pretrained_model_name_or_path),
+        **load_kwargs,
+    )
+    expand_sd3_transformer_input_for_paired_edit(cast(nn.Module, pipe.transformer))
+    apply_sd3_input_projection_patch(cast(nn.Module, pipe.transformer), checkpoint_dir)
+    cast(Any, pipe.transformer).load_lora_adapter(
+        str(checkpoint_dir),
+        prefix=None,
+        weight_name="pytorch_lora_weights.safetensors",
+        adapter_name="aura",
+    )
+    cast(Any, pipe.transformer).set_adapters(["aura"], weights=[float(cfg.evaluation.lora_scale)])
+    return pipe
+
+
+def load_sd3_condition_image(path: Path, width: int, height: int) -> PILImage:
+    image = load_rgb_image(path)
+    return cast(
+        PILImage,
+        ImageOps.fit(
+            image,
+            (width, height),
+            method=Image.Resampling.LANCZOS,
+        ),
+    )
+
+
+def encode_sd3_image_latents(
+    pipe: DiffusionPipeline,
+    image: PILImage,
+    device: torch.device,
+    dtype: torch.dtype,
+    generator: torch.Generator,
+    width: int,
+    height: int,
+) -> Tensor:
+    image_tensor = cast(Any, pipe.image_processor).preprocess(image, height=height, width=width)
+    image_tensor = image_tensor.to(device=device, dtype=dtype)
+    encoded = cast(Any, pipe.vae.encode(image_tensor))
+    latents = cast(Tensor, encoded.latent_dist.sample(generator=generator))
+    vae_config = cast(Any, pipe.vae.config)
+    latents = (latents - float(vae_config.shift_factor)) * float(vae_config.scaling_factor)
+    return latents.to(device=device, dtype=dtype)
+
+
+def sd3_timesteps(
+    pipe: DiffusionPipeline,
+    height: int,
+    width: int,
+    num_inference_steps: int,
+    device: torch.device,
+) -> Tensor:
+    scheduler_kwargs: dict[str, Any] = {}
+    scheduler = cast(Any, pipe.scheduler)
+    if bool(scheduler.config.get("use_dynamic_shifting", False)):
+        image_seq_len = (
+            height // cast(Any, pipe).vae_scale_factor // pipe.transformer.config.patch_size
+        ) * (width // cast(Any, pipe).vae_scale_factor // pipe.transformer.config.patch_size)
+        scheduler_kwargs["mu"] = calculate_shift(
+            image_seq_len,
+            scheduler.config.get("base_image_seq_len", 256),
+            scheduler.config.get("max_image_seq_len", 4096),
+            scheduler.config.get("base_shift", 0.5),
+            scheduler.config.get("max_shift", 1.16),
+        )
+    timesteps, _ = retrieve_timesteps(
+        scheduler,
+        num_inference_steps,
+        device,
+        **scheduler_kwargs,
+    )
+    return cast(Tensor, timesteps)
+
+
+def decode_sd3_latents(pipe: DiffusionPipeline, latents: Tensor) -> PILImage:
+    vae_config = cast(Any, pipe.vae.config)
+    decode_latents = (latents / float(vae_config.scaling_factor)) + float(vae_config.shift_factor)
+    image = pipe.vae.decode(decode_latents, return_dict=False)[0]
+    images = cast(
+        list[PILImage], cast(Any, pipe.image_processor).postprocess(image, output_type="pil")
+    )
+    if len(images) != 1:
+        raise RuntimeError(f"Expected 1 SD3 output image, received {len(images)}.")
+    return images[0]
+
+
+def run_sd3_batch(
+    pipe: DiffusionPipeline,
+    cfg: DictConfig,
+    input_paths: list[Path],
+    device_name: str,
+    batch_offset: int,
+) -> list[PILImage]:
+    images: list[PILImage] = []
+    device = torch.device(device_name)
+    dtype = dtype_from_precision(str(cfg.evaluation.mixed_precision))
+    configured_seed = evaluation_seed(cfg)
+    if configured_seed is None:
+        raise ValueError("SD3 inference requires evaluation.seed to be configured.")
+    seed = configured_seed
+    width = int(cfg.evaluation.width)
+    height = int(cfg.evaluation.height)
+    num_inference_steps = int(cfg.evaluation.num_inference_steps)
+    guidance_scale = float(cfg.evaluation.guidance_scale)
+    do_classifier_free_guidance = guidance_scale > 1.0
+
+    with torch.no_grad():
+        (
+            prompt_embeds,
+            negative_prompt_embeds,
+            pooled_prompt_embeds,
+            negative_pooled_prompt_embeds,
+        ) = cast(Any, pipe).encode_prompt(
+            prompt=str(cfg.evaluation.prompt),
+            prompt_2=None,
+            prompt_3=None,
+            negative_prompt="",
+            negative_prompt_2=None,
+            negative_prompt_3=None,
+            do_classifier_free_guidance=do_classifier_free_guidance,
+            device=device,
+            max_sequence_length=int(cfg.evaluation.max_sequence_length),
+        )
+        if do_classifier_free_guidance:
+            prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
+            pooled_prompt_embeds = torch.cat(
+                [negative_pooled_prompt_embeds, pooled_prompt_embeds], dim=0
+            )
+        prompt_embeds = prompt_embeds.to(device=device, dtype=dtype)
+        pooled_prompt_embeds = pooled_prompt_embeds.to(device=device, dtype=dtype)
+
+        for offset, input_path in enumerate(input_paths):
+            timesteps = sd3_timesteps(pipe, height, width, num_inference_steps, device)
+            start_timestep = timesteps[:1]
+            generator = torch.Generator(device=device_name).manual_seed(
+                seed + batch_offset + offset
+            )
+            source_image = load_sd3_condition_image(input_path, width, height)
+            source_latents = encode_sd3_image_latents(
+                pipe,
+                source_image,
+                device,
+                dtype,
+                generator,
+                width,
+                height,
+            )
+            noise = torch.randn(
+                source_latents.shape,
+                generator=generator,
+                device=device,
+                dtype=source_latents.dtype,
+            )
+            latents = pipe.scheduler.scale_noise(source_latents, start_timestep, noise)
+
+            for timestep in timesteps:
+                latent_model_input = (
+                    torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+                )
+                source_model_input = (
+                    torch.cat([source_latents] * 2)
+                    if do_classifier_free_guidance
+                    else source_latents
+                )
+                model_input = torch.cat([latent_model_input, source_model_input], dim=1)
+                timestep_batch = timestep.expand(model_input.shape[0])
+                noise_pred = cast(Any, pipe.transformer)(
+                    hidden_states=model_input,
+                    timestep=timestep_batch,
+                    encoder_hidden_states=prompt_embeds,
+                    pooled_projections=pooled_prompt_embeds,
+                    return_dict=False,
+                )[0]
+                if do_classifier_free_guidance:
+                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                    noise_pred = noise_pred_uncond + guidance_scale * (
+                        noise_pred_text - noise_pred_uncond
+                    )
+                latents = pipe.scheduler.step(noise_pred, timestep, latents, return_dict=False)[0]
+
+            images.append(decode_sd3_latents(pipe, latents))
+    return images

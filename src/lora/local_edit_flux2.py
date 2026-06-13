@@ -3,8 +3,6 @@ from __future__ import annotations
 import json
 import math
 import os
-import random
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
@@ -20,12 +18,13 @@ from PIL import Image, ImageOps
 from PIL.Image import Image as PILImage
 from peft import LoraConfig
 from torch import Tensor, nn
-from torch.utils.data import DataLoader, Dataset
-from torchvision import transforms
+from torch.utils.data import DataLoader
 
 from lora.local_edit_common import (
-    PairExample,
+    PairedPromptBatch,
+    PairedPromptDataset,
     apply_lora_checkpoint,
+    collate_paired_prompt_batches,
     dtype_from_precision,
     evaluation_seed,
     freeze_module,
@@ -40,59 +39,9 @@ from lora.local_edit_common import (
 )
 
 
-@dataclass(frozen=True)
-class FluxPreparedBatch:
-    source_pixels: Tensor
-    target_pixels: Tensor
-    prompts: list[str]
-
-
-class FluxPairedEditDataset(Dataset[FluxPreparedBatch]):
-    def __init__(
-        self,
-        examples: list[PairExample],
-        resolution: int,
-        center_crop: bool,
-        random_flip: bool,
-    ) -> None:
-        self.examples = examples
-        crop: transforms.CenterCrop | transforms.RandomCrop
-        crop = (
-            transforms.CenterCrop(resolution) if center_crop else transforms.RandomCrop(resolution)
-        )
-        transform_steps: list[Any] = [
-            transforms.Resize(resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-            crop,
-            transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5]),
-        ]
-        self.image_transform = transforms.Compose(transform_steps)
-        self.random_flip = random_flip
-
-    def __len__(self) -> int:
-        return len(self.examples)
-
-    def __getitem__(self, index: int) -> FluxPreparedBatch:
-        example = self.examples[index]
-        source_image = load_rgb_image(example.source_path)
-        target_image = load_rgb_image(example.target_path)
-        if self.random_flip and random.random() < 0.5:
-            source_image = source_image.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
-            target_image = target_image.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
-        return FluxPreparedBatch(
-            source_pixels=cast(Tensor, self.image_transform(source_image)),
-            target_pixels=cast(Tensor, self.image_transform(target_image)),
-            prompts=[example.prompt],
-        )
-
-
-def collate_flux_batches(items: list[FluxPreparedBatch]) -> FluxPreparedBatch:
-    prompts = [item.prompts[0] for item in items]
-    return FluxPreparedBatch(
-        source_pixels=torch.stack([item.source_pixels for item in items]),
-        target_pixels=torch.stack([item.target_pixels for item in items]),
-        prompts=prompts,
-    )
+FluxPreparedBatch = PairedPromptBatch
+FluxPairedEditDataset = PairedPromptDataset
+collate_flux_batches = collate_paired_prompt_batches
 
 
 def flow_match_noisy_latents(clean_latents: Tensor, noise: Tensor, sigmas: Tensor) -> Tensor:
