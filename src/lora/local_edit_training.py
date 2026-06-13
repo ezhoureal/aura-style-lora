@@ -45,6 +45,14 @@ from lora.local_edit_sd import (
     collate_batches,
     expand_unet_conv_in_for_ip2p,
 )
+from lora.local_edit_sd3 import (
+    SD3PairedEditDataset,
+    SD3PreparedBatch,
+    StableDiffusion3PairedEditLoraTrainer,
+    apply_sd3_input_projection_patch,
+    collate_sd3_batches,
+    expand_sd3_transformer_input_for_paired_edit,
+)
 
 
 class UnsupportedLocalEditTrainer:
@@ -63,6 +71,8 @@ def make_trainer(cfg: DictConfig, model_key: str) -> EditTrainer:
     trainer_name = str(cfg.models[model_key].trainer)
     if trainer_name == "stable_diffusion_ip2p_lora":
         return StableDiffusionIp2PLoraTrainer(cfg, model_key)
+    if trainer_name == "stable_diffusion_3_paired_edit_lora":
+        return StableDiffusion3PairedEditLoraTrainer(cfg, model_key)
     if trainer_name == "flux2_paired_edit_lora":
         return Flux2PairedEditLoraTrainer(cfg, model_key)
     if trainer_name == "unsupported_local_edit":
@@ -95,15 +105,21 @@ __all__ = [
     "PairedEditDataset",
     "PreparedBatch",
     "ResumeCheckpoint",
+    "SD3PairedEditDataset",
+    "SD3PreparedBatch",
     "StableDiffusionIp2PLoraTrainer",
+    "StableDiffusion3PairedEditLoraTrainer",
     "UnsupportedLocalEditTrainer",
     "apply_lora_checkpoint",
+    "apply_sd3_input_projection_patch",
     "checkpoint_step_from_path",
     "collate_batches",
     "collate_flux_batches",
+    "collate_sd3_batches",
     "configure_environment",
     "dtype_from_precision",
     "expand_unet_conv_in_for_ip2p",
+    "expand_sd3_transformer_input_for_paired_edit",
     "flow_match_noisy_latents",
     "flow_match_training_target",
     "freeze_module",

@@ -17,7 +17,9 @@ from lora.local_edit_training import (
     apply_lora_checkpoint,
     Flux2PairedEditLoraTrainer,
     REPO_ROOT,
+    StableDiffusion3PairedEditLoraTrainer,
     expand_unet_conv_in_for_ip2p,
+    expand_sd3_transformer_input_for_paired_edit,
     flow_match_noisy_latents,
     flow_match_training_target,
     load_pair_examples,
@@ -42,6 +44,25 @@ class TinyUnet(nn.Module):
         super().__init__()
         self.conv_in = nn.Conv2d(4, 8, 3, padding=1)
         self.config = TinyConfig()
+
+
+class TinySD3PosEmbed(nn.Module):
+    proj: nn.Conv2d
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.proj = nn.Conv2d(16, 8, 2, stride=2)
+
+
+class TinySD3Transformer(nn.Module):
+    pos_embed: TinySD3PosEmbed
+    config: TinyConfig
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.pos_embed = TinySD3PosEmbed()
+        self.config = TinyConfig()
+        self.config.in_channels = 16
 
 
 class TinyLoraTarget(nn.Module):
@@ -110,6 +131,24 @@ class UnetPatchTests(unittest.TestCase):
         self.assertTrue(torch.equal(unet.conv_in.weight[:, :4], original))
         self.assertTrue(
             torch.equal(unet.conv_in.weight[:, 4:], torch.zeros_like(unet.conv_in.weight[:, 4:]))
+        )
+
+
+class SD3PatchTests(unittest.TestCase):
+    def test_expands_input_projection_to_accept_source_latents(self) -> None:
+        transformer = TinySD3Transformer()
+        original = transformer.pos_embed.proj.weight.detach().clone()
+
+        expand_sd3_transformer_input_for_paired_edit(transformer)
+
+        self.assertEqual(transformer.pos_embed.proj.in_channels, 32)
+        self.assertEqual(transformer.config.in_channels, 32)
+        self.assertTrue(torch.equal(transformer.pos_embed.proj.weight[:, :16], original))
+        self.assertTrue(
+            torch.equal(
+                transformer.pos_embed.proj.weight[:, 16:],
+                torch.zeros_like(transformer.pos_embed.proj.weight[:, 16:]),
+            )
         )
 
 
@@ -218,6 +257,23 @@ class TrainerSelectionTests(unittest.TestCase):
         trainer = make_trainer(cfg, "flux2")
 
         self.assertIsInstance(trainer, Flux2PairedEditLoraTrainer)
+
+    def test_sd3_trainer_is_selected_from_config(self) -> None:
+        cfg = OmegaConf.create(
+            {
+                "training": {"output_root": "outputs/test"},
+                "models": {
+                    "sd35": {
+                        "trainer": "stable_diffusion_3_paired_edit_lora",
+                        "pretrained_model_name_or_path": "stabilityai/stable-diffusion-3.5-medium",
+                    }
+                },
+            }
+        )
+
+        trainer = make_trainer(cfg, "sd35")
+
+        self.assertIsInstance(trainer, StableDiffusion3PairedEditLoraTrainer)
 
 
 if __name__ == "__main__":

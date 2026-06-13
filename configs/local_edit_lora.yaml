@@ -1,5 +1,5 @@
 selected_models:
-  - flux2_klein_base
+  - sd15
 
 dataset:
   train_dir: dataset/train
@@ -28,7 +28,7 @@ training:
   allow_tf32: true
   dataloader_num_workers: 2
   checkpointing_steps: 250
-  resume_from_checkpoint: latest # latest / null / specific path
+  resume_from_checkpoint: null # latest / null / specific path
   max_grad_norm: 1.0
   guidance_scale: 4.0
   max_sequence_length: 512
@@ -38,8 +38,17 @@ training:
     - 9
     - 18
     - 27
-  local_files_only: false
+  local_files_only: true # switch to false if base model not already downloaded
   flux2_target_modules:
+    - to_q
+    - to_k
+    - to_v
+    - to_out.0
+    - add_q_proj
+    - add_k_proj
+    - add_v_proj
+    - to_add_out
+  sd3_target_modules:
     - to_q
     - to_k
     - to_v
@@ -50,14 +59,14 @@ training:
     - to_add_out
 
 evaluation:
-  input_dir: eval_data
+  input_dir: dataset/eval
   output_root: outputs/ablation/local_edit_eval
   checkpoint_dir: null
   prompt: "A strong colorful light is illuminating the subject's silhouette. The image is rendered in a smooth gradient of luminous light, giving a radiant and ethereal appearance. Subtle contour lighting highlights delicate outlines, adding depth and a refined, high-end cinematic glow"
   batch_size: 2
   height: ${dataset.resolution}
   width: ${dataset.resolution}
-  num_inference_steps: 28
+  num_inference_steps: 50
   guidance_scale: 4.0
   image_guidance_scale: 1.5
   lora_scale: 1.0
@@ -69,7 +78,7 @@ evaluation:
     - 9
     - 18
     - 27
-  local_files_only: false
+  local_files_only: true
 
 environment:
   hf_endpoint: https://hf-mirror.com
@@ -78,7 +87,7 @@ environment:
 models:
   sd15:
     display_name: Stable Diffusion 1.5
-    pretrained_model_name_or_path: stable-diffusion-v1-5/stable-diffusion-v1-5
+    pretrained_model_name_or_path: ${oc.env:SD15_MODEL_PATH,.hf_models/sd15}
     trainer: stable_diffusion_ip2p_lora
     revision: null
     prediction_type: null
@@ -93,8 +102,10 @@ models:
   sd35_medium:
     display_name: Stable Diffusion 3.5 Medium
     pretrained_model_name_or_path: stabilityai/stable-diffusion-3.5-medium
-    trainer: unsupported_local_edit
-    note: Local paired edit LoRA support is not implemented for SD3 transformer edit APIs yet.
+    trainer: stable_diffusion_3_paired_edit_lora
+    revision: null
+    variant: null
+    note: The paired edit trainer is scaffolded; core training_step logic is intentionally TODO.
   flux2_klein_base:
     display_name: FLUX.2 Klein Base 4B
     pretrained_model_name_or_path: ${oc.env:FLUX2_KLEIN_BASE_PATH,.hf_models/flux2-klein-base-4b}

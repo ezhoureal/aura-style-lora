@@ -9,21 +9,6 @@ The active local target is `flux2_klein_base`, a FLUX.2 Klein/Base 4B paired-edi
 Hydra config lives in `configs/local_edit_lora.yaml`; avoid ad hoc CLI argument drift by
 updating that YAML when changing training or eval settings.
 
-## Current Status
-
-- Active selected model: `flux2_klein_base`.
-- Dataset path: `dataset/train`.
-- Eval input path: `eval_data`.
-- Base model path: `${FLUX2_KLEIN_BASE_PATH}` or `.hf_models/flux2-klein-base-4b`.
-- Training completed to step `1000`.
-- Latest eval artifacts are under:
-  `outputs/ablation/local_edit_eval/flux2_klein_base`.
-
-The Flux2 inference path intentionally runs one pipeline call per conditioning image. In
-Diffusers FLUX.2, passing `image=[...]` means multiple reference images for one edit, not
-a batch of independent edits. The repo still iterates eval inputs in configured chunks, but
-each image is sent to the pipeline independently so `eval04.webp` maps to `eval04-004.png`.
-
 ## Layout
 
 - `src/lora/local_edit_common.py`: shared paths, dataset metadata, image loading, config,
@@ -32,6 +17,9 @@ each image is sent to the pipeline independently so `eval04.webp` maps to `eval0
   trainer, LoRA loading, and inference.
 - `src/lora/local_edit_sd.py`: Stable Diffusion InstructPix2Pix dataset, trainer, UNet
   input-channel patching, and inference.
+- `src/lora/local_edit_sd3.py`: Stable Diffusion 3.5 paired-edit trainer scaffold,
+  transformer input-projection patching, and LoRA checkpoint plumbing. The core
+  `training_step` is intentionally left as a TODO.
 - `src/lora/local_edit_training.py`: Hydra training entrypoint and trainer dispatch.
 - `src/lora/local_edit_inference.py`: Hydra inference entrypoint and model dispatch.
 - `scripts/train_local_edit_lora.py`: local Hydra training wrapper.
@@ -96,6 +84,7 @@ outputs/ablation/local_edit_eval/flux2_klein_base
 - `selected_models` currently contains only `flux2_klein_base`.
 - SD 1.5 and SD 2.1 trainer code remains in the repo, but the active paired Flux2 path is
   the one currently configured.
-- SD3 local paired-edit support is marked unsupported in config.
+- SD3.5 local paired-edit support is scaffolded in config, but its core train step is
+  intentionally unimplemented.
 - The eval code resizes/crops each Flux2 conditioning image to the configured eval canvas
   before inference, matching the training resolution by default and keeping VRAM predictable.

@@ -168,6 +168,7 @@ class StableDiffusionIp2PLoraTrainer:
             load_kwargs["revision"] = revision
         if variant is not None:
             load_kwargs["variant"] = variant
+        load_kwargs["local_files_only"] = bool(training_cfg.local_files_only)
         tokenizer = CLIPTokenizer.from_pretrained(
             model_id,
             subfolder="tokenizer",
@@ -406,7 +407,10 @@ def load_sd_pipeline(
     model_cfg = cfg.models[model_key]
     dtype = dtype_from_precision(str(cfg.evaluation.mixed_precision))
     model_id = str(model_cfg.pretrained_model_name_or_path)
-    load_kwargs: dict[str, Any] = {"torch_dtype": dtype}
+    load_kwargs: dict[str, Any] = {
+        "local_files_only": bool(cfg.evaluation.local_files_only),
+        "torch_dtype": dtype,
+    }
     revision = none_if_null(model_cfg.get("revision"))
     variant = none_if_null(model_cfg.get("variant"))
     if revision is not None:
