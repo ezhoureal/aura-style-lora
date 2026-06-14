@@ -312,7 +312,6 @@ def main() -> int:
                 "prompt": label.prompt,
                 "kind": "paired",
                 "conditioning_path": f"../conditioning/{pair_name}",
-                "source_label": label.label_path.name,
             },
         )
         if args.sleep:

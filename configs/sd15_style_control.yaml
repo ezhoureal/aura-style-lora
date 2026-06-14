@@ -1,0 +1,154 @@
+workflow:
+  stage: 0
+  description: SD1.5 realistic img2img baselines, style LoRA training, and ControlNet structure.
+
+environment:
+  hf_endpoint: https://hf-mirror.com
+  hf_hub_enable_hf_transfer: "1"
+
+models:
+  base:
+    # Download SG161222/Realistic_Vision_V6.0_B1_noVAE here, or set SD15_REALISTIC_MODEL_PATH.
+    pretrained_model_name_or_path: ${oc.env:SD15_REALISTIC_MODEL_PATH,.hf_models/realistic-vision-v60-b1-novae}
+    local_files_only: true
+    revision: null
+    variant: null
+  vae:
+    # Optional but recommended for Realistic Vision noVAE.
+    pretrained_model_name_or_path: ${oc.env:SD15_VAE_MODEL_PATH,.hf_models/sd-vae-ft-mse}
+    enabled: true
+    local_files_only: true
+  ip_adapter:
+    enabled: false
+    # Optional ablation: download h94/IP-Adapter here, or set IP_ADAPTER_MODEL_PATH.
+    pretrained_model_name_or_path: ${oc.env:IP_ADAPTER_MODEL_PATH,.hf_models/ip-adapter}
+    subfolder: models
+    weight_name: ip-adapter_sd15.bin
+    scale: 0.65
+    local_files_only: true
+  style_lora:
+    # Stage 0 B-D require this. Stage 1 produces this if you do not already have one.
+    path: ${oc.env:SD15_AURA_STYLE_LORA_PATH,null}
+    scale: 0.8
+    adapter_name: aura_style
+  controlnets:
+    canny:
+      pretrained_model_name_or_path: ${oc.env:CONTROLNET_CANNY_MODEL_PATH,.hf_models/control_v11p_sd15_canny}
+      local_files_only: true
+      scale: 0.75
+      start: 0.0
+      end: 0.85
+      preprocessor: canny
+      precomputed_dir: null
+      threshold: 96
+    lineart:
+      pretrained_model_name_or_path: ${oc.env:CONTROLNET_LINEART_MODEL_PATH,.hf_models/control_v11p_sd15_lineart}
+      local_files_only: true
+      scale: 0.7
+      start: 0.0
+      end: 0.85
+      preprocessor: lineart
+      precomputed_dir: null
+      threshold: 64
+    depth:
+      pretrained_model_name_or_path: ${oc.env:CONTROLNET_DEPTH_MODEL_PATH,.hf_models/control_v11f1p_sd15_depth}
+      local_files_only: true
+      scale: 0.55
+      start: 0.0
+      end: 0.8
+      # Keep depth precomputed until we add a dedicated depth-estimator model.
+      preprocessor: precomputed
+      precomputed_dir: dataset/stage0_depth
+      threshold: 0
+    tile:
+      pretrained_model_name_or_path: ${oc.env:CONTROLNET_TILE_MODEL_PATH,.hf_models/control_v11f1e_sd15_tile}
+      local_files_only: true
+      scale: 0.35
+      start: 0.35
+      end: 1.0
+      preprocessor: tile
+      precomputed_dir: null
+      threshold: 0
+
+stage0:
+  input_dir: dataset/stage0
+  style_image_path: dataset/style/aura_style.png
+  output_root: outputs/stage0/sd15_style_control
+  selected_baselines:
+    - a_img2img
+    - b_lora
+    - c_lora_canny
+    - d_lora_lineart_depth
+  baselines:
+    a_img2img:
+      display_name: A SD1.5 img2img, no LoRA
+      use_style_lora: false
+      controls: []
+    b_lora:
+      display_name: B SD1.5 + style LoRA
+      use_style_lora: true
+      controls: []
+    c_lora_canny:
+      display_name: C SD1.5 + style LoRA + ControlNet Canny
+      use_style_lora: true
+      controls:
+        - canny
+    d_lora_lineart_depth:
+      display_name: D SD1.5 + style LoRA + ControlNet Lineart/Depth
+      use_style_lora: true
+      controls:
+        - lineart
+        - depth
+  prompt_template: "<AURA_STYLE> style, {caption}"
+  negative_prompt: "deformed, disfigured, low quality, blurry, jpeg artifacts, bad anatomy, bad hands, extra limbs, text, watermark, cartoon, anime, cgi, 3d render"
+  default_caption: "a photorealistic subject"
+  caption_metadata_path: null
+  image_key: file_name
+  caption_key: caption
+  width: 512
+  height: 512
+  strength: 0.62
+  num_inference_steps: 35
+  guidance_scale: 6.5
+  seed: 42
+  limit: null
+  mixed_precision: fp16
+  attention_slicing: true
+  vae_slicing: true
+  model_cpu_offload: false
+
+stage1_training:
+  train_dir: dataset/aura_style_lora/train
+  output_root: outputs/stage1/sd15_style_lora
+  prompt_template: "<AURA_STYLE> style, {caption}"
+  resolution: 512
+  rank: 16
+  alternate_rank: 32
+  max_train_steps: 2000
+  max_train_steps_upper: 10000
+  train_batch_size: 1
+  gradient_accumulation_steps: 4
+  learning_rate: 1e-4
+  mixed_precision: fp16
+  seed: 42
+
+stage2_production:
+  use_source_image_latent_init: true
+  use_style_lora: true
+  prompt_template: "<AURA_STYLE> style, {caption}"
+  preferred_controls:
+    - canny
+    - lineart
+    - depth
+
+stage3_paired_controlnet:
+  enabled_when_structure_preservation_is_weak: true
+  condition_types:
+    - canny
+    - lineart
+    - depth
+  input_condition: source structure map
+  target: stylized image
+  freeze_base: true
+  train_controlnet: true
+  train_lora: false
