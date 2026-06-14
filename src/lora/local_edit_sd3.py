@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Protocol, cast
 
 import torch
 import torch.nn.functional as F
@@ -55,6 +55,31 @@ class SD3PromptEmbeds:
     pooled_prompt_embeds: Tensor
 
 
+class SD3ImageProcessor(Protocol):
+    def preprocess(self, image: PILImage, height: int, width: int) -> Tensor: ...
+
+
+class SD3LatentDistribution(Protocol):
+    def sample(self) -> Tensor: ...
+
+    def mode(self) -> Tensor: ...
+
+
+class SD3VaeEncodeOutput(Protocol):
+    latent_dist: SD3LatentDistribution
+
+
+class SD3VaeConfig(Protocol):
+    shift_factor: float
+    scaling_factor: float
+
+
+class SD3VaeEncoder(Protocol):
+    config: SD3VaeConfig
+
+    def encode(self, sample: Tensor) -> SD3VaeEncodeOutput: ...
+
+
 def expand_sd3_transformer_input_for_paired_edit(transformer: nn.Module) -> None:
     pos_embed = cast(Any, transformer).pos_embed
     projection = cast(nn.Conv2d, pos_embed.proj)
@@ -95,6 +120,11 @@ def apply_sd3_input_projection_patch(transformer: nn.Module, checkpoint_dir: Pat
         bias = state["bias"]
         if projection.bias is not None and bias.numel() > 0:
             projection.bias.copy_(bias.to(projection.bias.device))
+
+
+def enable_sd3_input_projection_training(transformer: nn.Module) -> None:
+    projection = cast(nn.Conv2d, cast(Any, transformer).pos_embed.proj)
+    projection.requires_grad_(True)
 
 
 class StableDiffusion3PairedEditLoraTrainer:
@@ -149,6 +179,7 @@ class StableDiffusion3PairedEditLoraTrainer:
                 target_modules=list(training_cfg.sd3_target_modules),
             )
         )
+        enable_sd3_input_projection_training(cast(nn.Module, pipe.transformer))
         if bool(training_cfg.gradient_checkpointing):
             pipe.transformer.enable_gradient_checkpointing()
 
@@ -401,15 +432,17 @@ def encode_sd3_image_latents(
     image: PILImage,
     device: torch.device,
     dtype: torch.dtype,
-    generator: torch.Generator,
     width: int,
     height: int,
 ) -> Tensor:
-    image_tensor = cast(Any, pipe.image_processor).preprocess(image, height=height, width=width)
+    image_processor = cast(SD3ImageProcessor, pipe.image_processor)
+    vae = cast(SD3VaeEncoder, pipe.vae)
+
+    image_tensor = image_processor.preprocess(image, height=height, width=width)
     image_tensor = image_tensor.to(device=device, dtype=dtype)
-    encoded = cast(Any, pipe.vae.encode(image_tensor))
-    latents = cast(Tensor, encoded.latent_dist.sample(generator=generator))
-    vae_config = cast(Any, pipe.vae.config)
+    encoded = vae.encode(image_tensor)
+    latents = encoded.latent_dist.mode()
+    vae_config = vae.config
     latents = (latents - float(vae_config.shift_factor)) * float(vae_config.scaling_factor)
     return latents.to(device=device, dtype=dtype)
 
@@ -443,6 +476,10 @@ def sd3_timesteps(
     return cast(Tensor, timesteps)
 
 
+def sd3_evaluation_guidance_scale(cfg: DictConfig) -> float:
+    return float(cfg.evaluation.get("sd3_guidance_scale", cfg.evaluation.guidance_scale))
+
+
 def decode_sd3_latents(pipe: DiffusionPipeline, latents: Tensor) -> PILImage:
     vae_config = cast(Any, pipe.vae.config)
     decode_latents = (latents / float(vae_config.scaling_factor)) + float(vae_config.shift_factor)
@@ -472,7 +509,7 @@ def run_sd3_batch(
     width = int(cfg.evaluation.width)
     height = int(cfg.evaluation.height)
     num_inference_steps = int(cfg.evaluation.num_inference_steps)
-    guidance_scale = float(cfg.evaluation.guidance_scale)
+    guidance_scale = sd3_evaluation_guidance_scale(cfg)
     do_classifier_free_guidance = guidance_scale > 1.0
 
     with torch.no_grad():
@@ -517,7 +554,6 @@ def run_sd3_batch(
                     source_image,
                     device,
                     dtype,
-                    generator,
                     width,
                     height,
                 )

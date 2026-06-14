@@ -44,6 +44,7 @@ from lora.local_edit_sd import (
     PreparedBatch,
     StableDiffusionIp2PLoraTrainer,
     collate_batches,
+    enable_unet_conv_in_training,
     expand_unet_conv_in_for_ip2p,
 )
 from lora.local_edit_sd3 import (
@@ -52,6 +53,7 @@ from lora.local_edit_sd3 import (
     StableDiffusion3PairedEditLoraTrainer,
     apply_sd3_input_projection_patch,
     collate_sd3_batches,
+    enable_sd3_input_projection_training,
     expand_sd3_transformer_input_for_paired_edit,
 )
 
@@ -126,7 +128,9 @@ __all__ = [
     "collate_sd3_batches",
     "configure_environment",
     "dtype_from_precision",
+    "enable_unet_conv_in_training",
     "expand_unet_conv_in_for_ip2p",
+    "enable_sd3_input_projection_training",
     "expand_sd3_transformer_input_for_paired_edit",
     "flow_match_noisy_latents",
     "flow_match_training_target",

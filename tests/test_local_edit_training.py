@@ -15,6 +15,8 @@ from torch import nn
 
 from lora.local_edit_training import (
     apply_lora_checkpoint,
+    enable_sd3_input_projection_training,
+    enable_unet_conv_in_training,
     Flux2PairedEditLoraTrainer,
     REPO_ROOT,
     StableDiffusion3PairedEditLoraTrainer,
@@ -209,6 +211,17 @@ class UnetPatchTests(unittest.TestCase):
             torch.equal(unet.conv_in.weight[:, 4:], torch.zeros_like(unet.conv_in.weight[:, 4:]))
         )
 
+    def test_unet_conv_in_can_be_reenabled_after_freezing(self) -> None:
+        unet = TinyUnet()
+        expand_unet_conv_in_for_ip2p(unet)  # type: ignore[arg-type]
+        unet.requires_grad_(False)
+
+        enable_unet_conv_in_training(unet)  # type: ignore[arg-type]
+
+        self.assertTrue(unet.conv_in.weight.requires_grad)
+        assert unet.conv_in.bias is not None
+        self.assertTrue(unet.conv_in.bias.requires_grad)
+
 
 class SD3PatchTests(unittest.TestCase):
     def test_expands_input_projection_to_accept_source_latents(self) -> None:
@@ -226,6 +239,17 @@ class SD3PatchTests(unittest.TestCase):
                 torch.zeros_like(transformer.pos_embed.proj.weight[:, 16:]),
             )
         )
+
+    def test_sd3_input_projection_can_be_reenabled_after_freezing(self) -> None:
+        transformer = TinySD3Transformer()
+        expand_sd3_transformer_input_for_paired_edit(transformer)
+        transformer.requires_grad_(False)
+
+        enable_sd3_input_projection_training(transformer)
+
+        self.assertTrue(transformer.pos_embed.proj.weight.requires_grad)
+        assert transformer.pos_embed.proj.bias is not None
+        self.assertTrue(transformer.pos_embed.proj.bias.requires_grad)
 
 
 class FlowMatchTests(unittest.TestCase):

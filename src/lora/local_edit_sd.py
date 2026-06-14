@@ -126,6 +126,10 @@ def expand_unet_conv_in_for_ip2p(unet: UNet2DConditionModel) -> None:
     cast(Any, unet.config).in_channels = 8
 
 
+def enable_unet_conv_in_training(unet: UNet2DConditionModel) -> None:
+    unet.conv_in.requires_grad_(True)
+
+
 class StableDiffusionIp2PLoraTrainer:
     def __init__(self, cfg: DictConfig, model_key: str) -> None:
         self.cfg = cfg
@@ -180,7 +184,6 @@ class StableDiffusionIp2PLoraTrainer:
         freeze_module(vae)
         freeze_module(text_encoder)
         freeze_module(unet)
-        unet.conv_in.requires_grad_(True)
         unet.add_adapter(
             LoraConfig(
                 r=int(training_cfg.rank),
@@ -189,6 +192,7 @@ class StableDiffusionIp2PLoraTrainer:
                 target_modules=["to_k", "to_q", "to_v", "to_out.0"],
             )
         )
+        enable_unet_conv_in_training(unet)
         if bool(training_cfg.gradient_checkpointing):
             unet.enable_gradient_checkpointing()
 
