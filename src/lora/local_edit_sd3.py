@@ -476,10 +476,6 @@ def sd3_timesteps(
     return cast(Tensor, timesteps)
 
 
-def sd3_evaluation_guidance_scale(cfg: DictConfig) -> float:
-    return float(cfg.evaluation.get("sd3_guidance_scale", cfg.evaluation.guidance_scale))
-
-
 def decode_sd3_latents(pipe: DiffusionPipeline, latents: Tensor) -> PILImage:
     vae_config = cast(Any, pipe.vae.config)
     decode_latents = (latents / float(vae_config.scaling_factor)) + float(vae_config.shift_factor)
@@ -509,7 +505,7 @@ def run_sd3_batch(
     width = int(cfg.evaluation.width)
     height = int(cfg.evaluation.height)
     num_inference_steps = int(cfg.evaluation.num_inference_steps)
-    guidance_scale = sd3_evaluation_guidance_scale(cfg)
+    guidance_scale = int(cfg.evaluation.guidance_scale)
     do_classifier_free_guidance = guidance_scale > 1.0
 
     with torch.no_grad():

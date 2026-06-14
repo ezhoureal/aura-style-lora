@@ -1,6 +1,3 @@
-## Constraints
-- minimize VRAM and RAM usage while preserving high-quality LORA training. Always check local GPU config.
-
 ## Development Guidelines
 - manage script config with hydra in separate config folder. Avoid using CLI arguments.
 - when tweaking script args, you are allowed to append the arg values to the command directly, but make sure to update yaml config files afterwards, to keep it reproducible and tractable.
