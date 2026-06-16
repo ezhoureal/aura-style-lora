@@ -1,0 +1,59 @@
+workflow:
+  stage: 1
+  description: Train a plain SD1.5 aura style LoRA for the style-control eval workflow.
+
+environment:
+  hf_endpoint: https://hf-mirror.com
+  hf_hub_enable_hf_transfer: "1"
+
+models:
+  base:
+    pretrained_model_name_or_path: ${oc.env:SD15_REALISTIC_MODEL_PATH,.hf_models/realistic-vision-v60-b1-novae}
+    local_files_only: true
+    revision: null
+    variant: null
+  vae:
+    pretrained_model_name_or_path: ${oc.env:SD15_VAE_MODEL_PATH,.hf_models/sd-vae-ft-mse}
+    enabled: true
+    local_files_only: true
+
+dataset:
+  train_dir: dataset/train
+  image_key: file_name
+  prompt_key: prompt
+  kind_key: kind
+  paired_kind: paired
+  resolution: 512
+  center_crop: true
+  random_flip: false
+
+prompt:
+  trigger: "<AURA_STYLE>"
+  style_description: "a strong colorful light is illuminating the subject's silhouette. The image is rendered in a smooth gradient of luminous light, giving a radiant and ethereal appearance. Subtle contour lighting highlights delicate outlines, adding depth and a refined, high-end cinematic glow"
+  fallback_template: "Render the subject in {trigger} style: {style_description}"
+
+training:
+  output_root: outputs/stage1/sd15_style_lora
+  max_train_steps: 2000
+  train_batch_size: 1
+  gradient_accumulation_steps: 4
+  learning_rate: 1e-4
+  lr_scheduler: cosine
+  lr_warmup_steps: 50
+  rank: 16
+  lora_alpha: 16
+  seed: 42
+  mixed_precision: fp16
+  gradient_checkpointing: true
+  allow_tf32: true
+  dataloader_num_workers: 2
+  checkpointing_steps: 500
+  resume_from_checkpoint: null
+  max_grad_norm: 1.0
+  local_files_only: true
+  prediction_type: null
+  target_modules:
+    - to_k
+    - to_q
+    - to_v
+    - to_out.0

@@ -26,6 +26,9 @@ dependencies = [
     "protobuf>=7.35.0",
     "requests>=2.34.2",
     "socksio>=1.0.0",
+    "onnx>=1.21.0",
+    "onnxruntime>=1.26.0",
+    "onnxscript>=0.7.0",
 ]
 
 [dependency-groups]

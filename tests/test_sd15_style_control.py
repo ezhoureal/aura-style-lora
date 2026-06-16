@@ -21,9 +21,9 @@ from lora.sd15_style_control import (
 
 class SD15StyleControlConfigTests(unittest.TestCase):
     def test_selected_baselines_preserve_config_order(self) -> None:
-        cfg = OmegaConf.create({"stage0": {"selected_baselines": ["a_img2img", "c_lora_canny"]}})
+        cfg = OmegaConf.create({"stage0": {"selected_baselines": ["a_img2img", "b_control_canny"]}})
 
-        self.assertEqual(selected_baseline_keys(cfg), ["a_img2img", "c_lora_canny"])
+        self.assertEqual(selected_baseline_keys(cfg), ["a_img2img", "b_control_canny"])
 
     def test_stage0_examples_use_metadata_captions(self) -> None:
         with tempfile.TemporaryDirectory(dir=REPO_ROOT) as tmp:

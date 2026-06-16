@@ -28,7 +28,8 @@ models:
     local_files_only: true
   style_lora:
     # Stage 0 B-D require this. Stage 1 produces this if you do not already have one.
-    path: ${oc.env:SD15_AURA_STYLE_LORA_PATH,null}
+    path: ${oc.env:SD15_AURA_STYLE_LORA_PATH,outputs/stage1/sd15_style_lora/checkpoint-002000}
+    weight_name: pipeline_lora_weights.safetensors
     scale: 0.8
     adapter_name: aura_style
   controlnets:
@@ -71,29 +72,44 @@ models:
       threshold: 0
 
 stage0:
-  input_dir: dataset/stage0
+  input_dir: dataset/eval
   style_image_path: dataset/style/aura_style.png
-  output_root: outputs/stage0/sd15_style_control
+  output_root: outputs/no_lora/sd15_style_control
   selected_baselines:
     - a_img2img
-    - b_lora
-    - c_lora_canny
-    - d_lora_lineart_depth
+    - b_control_canny
+    - c_control_lineart
   baselines:
     a_img2img:
       display_name: A SD1.5 img2img, no LoRA
       use_style_lora: false
       controls: []
-    b_lora:
+    b_control_canny:
+      display_name: B SD1.5 + ControlNet Canny, no LoRA
+      use_style_lora: false
+      controls:
+        - canny
+    c_control_lineart:
+      display_name: C SD1.5 + ControlNet Lineart, no LoRA
+      use_style_lora: false
+      controls:
+        - lineart
+    d_control_lineart_depth:
+      display_name: D SD1.5 + ControlNet Lineart/Depth, no LoRA
+      use_style_lora: false
+      controls:
+        - lineart
+        - depth
+    e_lora:
       display_name: B SD1.5 + style LoRA
       use_style_lora: true
       controls: []
-    c_lora_canny:
+    f_lora_canny:
       display_name: C SD1.5 + style LoRA + ControlNet Canny
       use_style_lora: true
       controls:
         - canny
-    d_lora_lineart_depth:
+    g_lora_lineart_depth:
       display_name: D SD1.5 + style LoRA + ControlNet Lineart/Depth
       use_style_lora: true
       controls:

@@ -16,3 +16,6 @@ outputs/
 samples/
 dataset/
 .hf_models
+.cannkit_downloads
+.cannkit_tools
+kernel_meta_temp_

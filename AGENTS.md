@@ -1,7 +1,7 @@
 ## Development Guidelines
 - manage script config with hydra in separate config folder. Avoid using CLI arguments.
 - when tweaking script args, you are allowed to append the arg values to the command directly, but make sure to update yaml config files afterwards, to keep it reproducible and tractable.
-- Verify with unit tests and e2e tests are of utmost importance.
+- Verify critical paths with unit tests and e2e tests, and add regression tests when fixing a bug.
 - Use strict typing via Pyright. Ensure all typing errors are cleared after an edit.
 - Use ruff to format all src files.
 - avoid dynamic import like `require_import` as much as possible. aim for simplicity.

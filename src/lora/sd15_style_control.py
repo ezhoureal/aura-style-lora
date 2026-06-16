@@ -232,7 +232,11 @@ def load_stage0_pipeline(
         if not resolved_lora_path.exists():
             raise FileNotFoundError(f"Style LoRA is missing: {resolved_lora_path}")
         adapter_name = str(cfg.models.style_lora.adapter_name)
-        pipe.load_lora_weights(str(resolved_lora_path), adapter_name=adapter_name)
+        pipe.load_lora_weights(
+            str(resolved_lora_path),
+            weight_name=str(cfg.models.style_lora.weight_name),
+            adapter_name=adapter_name,
+        )
         pipe.set_adapters(adapter_name, adapter_weights=float(cfg.models.style_lora.scale))
 
     if bool(cfg.stage0.attention_slicing):
