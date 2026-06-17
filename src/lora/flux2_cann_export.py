@@ -38,8 +38,9 @@ ONNX_INPUT_NAMES = [
 ]
 ONNX_OUTPUT_NAMES = ["sample"]
 SUPPORTED_QUANTIZATION_MODES = {"none", "int8_dynamic", "int4_palette"}
+SUPPORTED_CANN_TARGETS = {"om", "omc", "tiny", "ispnn", "security"}
 SANITIZER_EXTERNAL_DATA_MARKER = "lora_flux_omg_sanitized"
-SANITIZER_VERSION = "6"
+SANITIZER_VERSION = "7"
 MAX_DUPLICATED_INITIALIZER_BYTES = 1024
 
 
@@ -349,12 +350,24 @@ def transpose_perm(node: onnx.NodeProto) -> list[int]:
 def rewrite_rank3_transpose_for_omg(model: onnx.ModelProto) -> None:
     rewritten_nodes: list[onnx.NodeProto] = []
     existing_initializer_names = {initializer.name for initializer in model.graph.initializer}
+    shapes_by_name: dict[str, list[int]] = {}
+    for value_info in (
+        list(model.graph.input) + list(model.graph.value_info) + list(model.graph.output)
+    ):
+        shape = value_info.type.tensor_type.shape
+        if all(dim.HasField("dim_value") for dim in shape.dim):
+            shapes_by_name[value_info.name] = [int(dim.dim_value) for dim in shape.dim]
+
     for node in model.graph.node:
         if node.op_type != "Transpose" or transpose_perm(node) != [0, 2, 1]:
             rewritten_nodes.append(node)
             continue
+        output_shape = shapes_by_name.get(node.output[0])
+        if output_shape is None:
+            rewritten_nodes.append(node)
+            continue
 
-        axes_name = f"{node.name}_omg_rank4_axes"
+        axes_name = f"{node.output[0]}_omg_rank4_axes"
         if axes_name not in existing_initializer_names:
             axes = numpy_helper.from_array(torch.tensor([1], dtype=torch.int64).numpy(), axes_name)
             model.graph.initializer.append(axes)
@@ -362,6 +375,14 @@ def rewrite_rank3_transpose_for_omg(model: onnx.ModelProto) -> None:
 
         unsqueeze_output = f"{node.output[0]}_omg_rank4_unsqueeze"
         transpose_output = f"{node.output[0]}_omg_rank4_transpose"
+        shape_name = f"{node.output[0]}_omg_rank3_shape"
+        if shape_name not in existing_initializer_names:
+            shape_tensor = numpy_helper.from_array(
+                torch.tensor(output_shape, dtype=torch.int64).numpy(),
+                shape_name,
+            )
+            model.graph.initializer.append(shape_tensor)
+            existing_initializer_names.add(shape_name)
         rewritten_nodes.extend(
             [
                 onnx.helper.make_node(
@@ -378,10 +399,10 @@ def rewrite_rank3_transpose_for_omg(model: onnx.ModelProto) -> None:
                     perm=[0, 1, 3, 2],
                 ),
                 onnx.helper.make_node(
-                    "Squeeze",
-                    [transpose_output, axes_name],
+                    "Reshape",
+                    [transpose_output, shape_name],
                     [node.output[0]],
-                    name=f"{node.name}_omg_rank4_squeeze",
+                    name=f"{node.name}_omg_rank3_reshape",
                 ),
             ]
         )
@@ -410,7 +431,12 @@ def expand_clip_scalar_bounds_for_omg(model: onnx.ModelProto) -> None:
 def rewrite_clip_for_omg(model: onnx.ModelProto) -> None:
     rewritten_nodes: list[onnx.NodeProto] = []
     for node in model.graph.node:
-        if node.op_type != "Clip" or len(node.input) != 3 or node.input[1] == "" or node.input[2] == "":
+        if (
+            node.op_type != "Clip"
+            or len(node.input) != 3
+            or node.input[1] == ""
+            or node.input[2] == ""
+        ):
             rewritten_nodes.append(node)
             continue
         max_output = f"{node.output[0]}_omg_clip_min"
@@ -429,6 +455,44 @@ def rewrite_clip_for_omg(model: onnx.ModelProto) -> None:
                     name=f"{node.name}_omg_clip_max",
                 ),
             ]
+        )
+
+    del model.graph.node[:]
+    model.graph.node.extend(rewritten_nodes)
+
+
+def static_shapes(model: onnx.ModelProto) -> dict[str, list[int]]:
+    shapes: dict[str, list[int]] = {}
+    for value_info in (
+        list(model.graph.input) + list(model.graph.value_info) + list(model.graph.output)
+    ):
+        dims = value_info.type.tensor_type.shape.dim
+        if all(dim.HasField("dim_value") for dim in dims):
+            shapes[value_info.name] = [int(dim.dim_value) for dim in dims]
+    return shapes
+
+
+def rewrite_static_squeeze_ops_for_omg(model: onnx.ModelProto) -> None:
+    shapes_by_name = static_shapes(model)
+    rewritten_nodes: list[onnx.NodeProto] = []
+    for node in model.graph.node:
+        output_shape = shapes_by_name.get(node.output[0]) if len(node.output) == 1 else None
+        if node.op_type not in {"Squeeze", "Unsqueeze"} or output_shape is None:
+            rewritten_nodes.append(node)
+            continue
+        shape_name = f"{node.output[0]}_omg_static_shape"
+        model.graph.initializer.append(
+            numpy_helper.from_array(
+                torch.tensor(output_shape, dtype=torch.int64).numpy(), shape_name
+            )
+        )
+        rewritten_nodes.append(
+            onnx.helper.make_node(
+                "Reshape",
+                [node.input[0], shape_name],
+                list(node.output),
+                name=f"{node.name}_omg_static_reshape",
+            )
         )
 
     del model.graph.node[:]
@@ -540,6 +604,7 @@ def sanitize_onnx_for_omg(onnx_path: Path) -> None:
     rewrite_double_casts_for_omg(model)
     rewrite_rank3_transpose_for_omg(model)
     rewrite_clip_for_omg(model)
+    rewrite_static_squeeze_ops_for_omg(model)
     duplicate_shared_small_initializers_for_omg(model)
     remove_external_data_file(onnx_path)
     mark_model_sanitized(model)
@@ -585,6 +650,20 @@ def use_quantized_onnx_for_omg(cfg: DictConfig) -> bool:
     return bool(cfg.export.cann.get("use_quantized_onnx", True))
 
 
+def cann_target(cfg: DictConfig) -> str:
+    target = str(cfg.export.cann.get("target", "omc"))
+    if target not in SUPPORTED_CANN_TARGETS:
+        raise ValueError(f"Unsupported CANN target: {target}")
+    return target
+
+
+def optional_omg_flag(cfg: DictConfig, key: str) -> list[str]:
+    value = none_if_null(cfg.export.cann.get(key))
+    if value is None:
+        return []
+    return [f"--{key}={value}"]
+
+
 def omg_command(
     cfg: DictConfig, onnx_path: Path, shape: Flux2DenoiserShape, output_dir: Path
 ) -> list[str]:
@@ -614,13 +693,18 @@ def omg_command(
         "--framework=5",
         f"--model={model_arg}",
         f"--output={output_arg}",
+        f"--target={cann_target(cfg)}",
         f"--platform={cann_cfg.platform}",
         f"--input_shape={input_shape}",
+        *optional_omg_flag(cfg, "input_format"),
+        *optional_omg_flag(cfg, "weight_data_type"),
+        *optional_omg_flag(cfg, "input_type"),
+        *optional_omg_flag(cfg, "output_type"),
     ]
 
 
 def om_output_path(cfg: DictConfig, output_dir: Path) -> Path:
-    return output_dir / f"{cfg.export.cann.output_name}.om"
+    return output_dir / f"{cfg.export.cann.output_name}.{cann_target(cfg)}"
 
 
 def conversion_input_path(onnx_path: Path, quantized_path: Path | None) -> Path:
@@ -638,9 +722,7 @@ def existing_quantized_model_path(cfg: DictConfig, output_dir: Path) -> Path | N
     return None
 
 
-def om_conversion_input_path(
-    cfg: DictConfig, onnx_path: Path, quantized_path: Path | None
-) -> Path:
+def om_conversion_input_path(cfg: DictConfig, onnx_path: Path, quantized_path: Path | None) -> Path:
     if use_quantized_onnx_for_omg(cfg):
         return conversion_input_path(onnx_path, quantized_path)
     return onnx_path
@@ -675,8 +757,8 @@ def require_omg(omg_path: str) -> str:
     if resolved is None:
         raise FileNotFoundError(
             "HarmonyOS CANN Kit OMG executable was not found. Download DDK-tools from "
-            "Huawei CANN Kit preparations, install the kirin9020 platform plugin under "
-            "tools/platform/kirin9020, or set export.cann.omg_path to tools_omg/omg."
+            "Huawei CANN Kit preparations, install the target platform plugin under "
+            "tools/platform/<platform>, or set export.cann.omg_path to tools_omg/omg."
         )
     return resolved
 

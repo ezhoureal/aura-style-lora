@@ -16,6 +16,7 @@ from omegaconf import OmegaConf
 from lora.flux2_cann_export import (
     ExportableRMSNorm,
     Flux2DenoiserShape,
+    cann_target,
     checkpoint_dir_from_config,
     convert_existing_om,
     conversion_input_path,
@@ -29,6 +30,7 @@ from lora.flux2_cann_export import (
     require_omg,
     sanitize_onnx_for_omg,
     shape_from_config,
+    static_shapes,
     strip_intermediate_value_info,
     write_manifest,
 )
@@ -109,9 +111,12 @@ class Flux2CannExportManifestTests(unittest.TestCase):
                         "reduce_range": False,
                     },
                     "cann": {
-                        "platform": "kirin9020",
+                        "platform": "kirin9030",
                         "output_name": "transformer_denoiser",
                         "omg_path": "omg",
+                        "target": "omc",
+                        "input_format": None,
+                        "weight_data_type": "FP16",
                         "fallback_to_fp16": True,
                     },
                 },
@@ -148,11 +153,16 @@ class Flux2CannExportManifestTests(unittest.TestCase):
         self.assertFalse(manifest["onnx_path"].startswith("/home/"))
         self.assertEqual(manifest["quantization"]["mode"], "int8_dynamic")
         self.assertIn("--framework=5", manifest["cann_omg_command"])
-        self.assertIn("--platform=kirin9020", manifest["cann_omg_command"])
-        self.assertIn("hidden_states:1,2048,128", manifest["cann_omg_command"][-1])
+        self.assertIn("--target=omc", manifest["cann_omg_command"])
+        self.assertIn("--platform=kirin9030", manifest["cann_omg_command"])
+        self.assertNotIn("--input_format=None", manifest["cann_omg_command"])
+        self.assertIn("--weight_data_type=FP16", manifest["cann_omg_command"])
+        self.assertTrue(
+            any("hidden_states:1,2048,128" in arg for arg in manifest["cann_omg_command"])
+        )
         self.assertEqual(
             manifest["om_path"],
-            f"{output_dir.relative_to(REPO_ROOT)}/transformer_denoiser.om",
+            f"{output_dir.relative_to(REPO_ROOT)}/transformer_denoiser.omc",
         )
 
     def test_omg_command_uses_quantized_model_when_supplied_by_manifest_helper(self) -> None:
@@ -160,9 +170,10 @@ class Flux2CannExportManifestTests(unittest.TestCase):
             {
                 "export": {
                     "cann": {
-                        "platform": "kirin9020",
+                        "platform": "kirin9030",
                         "output_name": "transformer_denoiser",
                         "omg_path": "omg",
+                        "target": "omc",
                     }
                 }
             }
@@ -180,7 +191,9 @@ class Flux2CannExportManifestTests(unittest.TestCase):
 
         self.assertIn("--model=model.int8.onnx", command)
         self.assertIn("--output=out/transformer_denoiser", command)
-        self.assertIn("--platform=kirin9020", command)
+        self.assertIn("--target=omc", command)
+        self.assertIn("--platform=kirin9030", command)
+        self.assertNotIn("--input_format=NCHW", command)
 
     def test_manifest_records_fp16_omg_input_when_quantized_conversion_is_disabled(self) -> None:
         cfg = OmegaConf.create(
@@ -194,9 +207,10 @@ class Flux2CannExportManifestTests(unittest.TestCase):
                         "reduce_range": False,
                     },
                     "cann": {
-                        "platform": "kirin9020",
+                        "platform": "kirin9030",
                         "output_name": "transformer_denoiser",
                         "omg_path": "omg",
+                        "target": "omc",
                         "use_quantized_onnx": False,
                     },
                 },
@@ -227,6 +241,12 @@ class Flux2CannExportManifestTests(unittest.TestCase):
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
         self.assertTrue(manifest["cann_omg_command"][2].endswith("transformer.onnx"))
+
+    def test_cann_target_rejects_unknown_target(self) -> None:
+        cfg = OmegaConf.create({"export": {"cann": {"target": "bad_target"}}})
+
+        with self.assertRaisesRegex(ValueError, "Unsupported CANN target"):
+            cann_target(cfg)
 
     def test_conversion_prefers_quantized_model_when_available(self) -> None:
         self.assertEqual(
@@ -270,7 +290,7 @@ class Flux2CannExportManifestTests(unittest.TestCase):
             {
                 "export": {
                     "cann": {
-                        "platform": "kirin9020",
+                        "platform": "kirin9030",
                         "output_name": "transformer_denoiser",
                         "omg_path": "omg",
                         "fallback_to_fp16": True,
@@ -308,17 +328,18 @@ class Flux2CannExportManifestTests(unittest.TestCase):
                     output_dir,
                 )
 
-        self.assertEqual(om_path.name, "transformer_denoiser.om")
+        self.assertEqual(om_path.name, "transformer_denoiser.omc")
         self.assertEqual(run_mock.call_count, 2)
         self.assertIn("--model=model.int8.onnx", run_mock.call_args_list[0].args[0])
         self.assertIn("--model=model.onnx", run_mock.call_args_list[1].args[0])
+        self.assertIn("--target=omc", run_mock.call_args_list[0].args[0])
 
     def test_convert_to_om_uses_fp16_when_quantized_omg_input_is_disabled(self) -> None:
         cfg = OmegaConf.create(
             {
                 "export": {
                     "cann": {
-                        "platform": "kirin9020",
+                        "platform": "kirin9030",
                         "output_name": "transformer_denoiser",
                         "omg_path": "omg",
                         "fallback_to_fp16": True,
@@ -386,9 +407,10 @@ class Flux2CannExportManifestTests(unittest.TestCase):
                             "reduce_range": False,
                         },
                         "cann": {
-                            "platform": "kirin9020",
+                            "platform": "kirin9030",
                             "output_name": "transformer_denoiser",
                             "omg_path": "omg",
+                            "target": "omc",
                             "fallback_to_fp16": True,
                         },
                     },
@@ -397,11 +419,11 @@ class Flux2CannExportManifestTests(unittest.TestCase):
 
             with mock.patch(
                 "lora.flux2_cann_export.convert_to_om",
-                return_value=output_dir / "transformer_denoiser.om",
+                return_value=output_dir / "transformer_denoiser.omc",
             ) as convert_mock:
                 om_path = convert_existing_om(cfg)
 
-        self.assertEqual(om_path.name, "transformer_denoiser.om")
+        self.assertEqual(om_path.name, "transformer_denoiser.omc")
         self.assertEqual(convert_mock.call_args.args[2].name, "transformer.int8.onnx")
 
     def test_existing_quantized_model_is_ignored_when_quantization_is_disabled(self) -> None:
@@ -565,9 +587,7 @@ class Flux2CannQuantizationTests(unittest.TestCase):
     def test_sanitize_onnx_for_omg_rewrites_rank3_transpose_for_mobile_fusion(self) -> None:
         input_info = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 2, 3])
         output_info = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 3, 2])
-        node = helper.make_node(
-            "Transpose", ["x"], ["y"], name="rank3_transpose", perm=[0, 2, 1]
-        )
+        node = helper.make_node("Transpose", ["x"], ["y"], name="rank3_transpose", perm=[0, 2, 1])
         graph = helper.make_graph([node], "tiny", [input_info], [output_info])
         model = helper.make_model(graph)
         with tempfile.TemporaryDirectory(dir=REPO_ROOT) as tmp:
@@ -577,10 +597,49 @@ class Flux2CannQuantizationTests(unittest.TestCase):
             sanitize_onnx_for_omg(model_path)
             sanitized = onnx.load(model_path)
 
-        self.assertEqual([node.op_type for node in sanitized.graph.node], ["Unsqueeze", "Transpose", "Squeeze"])
+        self.assertEqual(
+            [node.op_type for node in sanitized.graph.node],
+            ["Unsqueeze", "Transpose", "Reshape"],
+        )
         transpose = sanitized.graph.node[1]
         self.assertEqual([attribute.name for attribute in transpose.attribute], ["perm"])
         self.assertEqual(list(transpose.attribute[0].ints), [0, 1, 3, 2])
+
+    def test_static_shapes_reads_only_fully_static_shapes(self) -> None:
+        static_info = helper.make_tensor_value_info("static", TensorProto.FLOAT, [1, 2])
+        dynamic_info = helper.make_tensor_value_info("dynamic", TensorProto.FLOAT, [None, 2])
+        graph = helper.make_graph([], "tiny", [static_info, dynamic_info], [])
+        model = helper.make_model(graph)
+
+        self.assertEqual(static_shapes(model), {"static": [1, 2]})
+
+    def test_sanitize_onnx_for_omg_rewrites_static_squeeze_ops_to_reshape(self) -> None:
+        input_info = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 2])
+        unsqueezed_info = helper.make_tensor_value_info("expanded", TensorProto.FLOAT, [1, 2, 1])
+        output_info = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 2])
+        axes = helper.make_tensor("axes", TensorProto.INT64, [1], [-1])
+        unsqueeze = helper.make_node("Unsqueeze", ["x", "axes"], ["expanded"], name="expand")
+        squeeze = helper.make_node("Squeeze", ["expanded", "axes"], ["y"], name="squeeze")
+        graph = helper.make_graph(
+            [unsqueeze, squeeze],
+            "tiny",
+            [input_info],
+            [output_info],
+            initializer=[axes],
+            value_info=[unsqueezed_info],
+        )
+        model = helper.make_model(graph)
+        with tempfile.TemporaryDirectory(dir=REPO_ROOT) as tmp:
+            model_path = Path(tmp) / "tiny.onnx"
+            onnx.save(model, model_path)
+
+            sanitize_onnx_for_omg(model_path)
+            sanitized = onnx.load(model_path)
+
+        self.assertEqual([node.op_type for node in sanitized.graph.node], ["Reshape", "Reshape"])
+        initializer_names = {initializer.name for initializer in sanitized.graph.initializer}
+        self.assertIn("expanded_omg_static_shape", initializer_names)
+        self.assertIn("y_omg_static_shape", initializer_names)
 
     def test_sanitize_onnx_for_omg_duplicates_shared_small_initializers(self) -> None:
         input_info = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 2])
