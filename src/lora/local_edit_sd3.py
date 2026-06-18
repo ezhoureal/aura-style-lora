@@ -488,6 +488,13 @@ def decode_sd3_latents(pipe: DiffusionPipeline, latents: Tensor) -> PILImage:
     return images[0]
 
 
+def sd3_evaluation_guidance_scale(cfg: DictConfig) -> float:
+    configured = none_if_null(cfg.evaluation.get("sd3_guidance_scale"))
+    if configured is None:
+        return float(cfg.evaluation.guidance_scale)
+    return float(configured)
+
+
 def run_sd3_batch(
     pipe: DiffusionPipeline,
     cfg: DictConfig,
@@ -505,7 +512,7 @@ def run_sd3_batch(
     width = int(cfg.evaluation.width)
     height = int(cfg.evaluation.height)
     num_inference_steps = int(cfg.evaluation.num_inference_steps)
-    guidance_scale = int(cfg.evaluation.guidance_scale)
+    guidance_scale = sd3_evaluation_guidance_scale(cfg)
     do_classifier_free_guidance = guidance_scale > 1.0
 
     with torch.no_grad():

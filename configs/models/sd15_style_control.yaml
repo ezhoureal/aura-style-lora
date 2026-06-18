@@ -1,0 +1,53 @@
+defaults:
+  - sd15_style
+  - _self_
+
+ip_adapter:
+  enabled: false
+  pretrained_model_name_or_path: ${oc.env:IP_ADAPTER_MODEL_PATH,.hf_models/ip-adapter}
+  subfolder: models
+  weight_name: ip-adapter_sd15.bin
+  scale: 0.65
+  local_files_only: true
+style_lora:
+  path: ${oc.env:SD15_AURA_STYLE_LORA_PATH,outputs/stage1/sd15_style_lora/checkpoint-002000}
+  weight_name: pipeline_lora_weights.safetensors
+  scale: 0.8
+  adapter_name: aura_style
+controlnets:
+  canny:
+    pretrained_model_name_or_path: ${oc.env:CONTROLNET_CANNY_MODEL_PATH,.hf_models/control_v11p_sd15_canny}
+    local_files_only: true
+    scale: 0.75
+    start: 0.0
+    end: 0.85
+    preprocessor: canny
+    precomputed_dir: null
+    threshold: 96
+  lineart:
+    pretrained_model_name_or_path: ${oc.env:CONTROLNET_LINEART_MODEL_PATH,.hf_models/control_v11p_sd15_lineart}
+    local_files_only: true
+    scale: 0.7
+    start: 0.0
+    end: 0.85
+    preprocessor: lineart
+    precomputed_dir: null
+    threshold: 64
+  depth:
+    pretrained_model_name_or_path: ${oc.env:CONTROLNET_DEPTH_MODEL_PATH,.hf_models/control_v11f1p_sd15_depth}
+    local_files_only: true
+    scale: 0.55
+    start: 0.0
+    end: 0.8
+    preprocessor: precomputed
+    precomputed_dir: dataset/stage0_depth
+    threshold: 0
+  tile:
+    pretrained_model_name_or_path: ${oc.env:CONTROLNET_TILE_MODEL_PATH,.hf_models/control_v11f1e_sd15_tile}
+    local_files_only: true
+    scale: 0.35
+    start: 0.35
+    end: 1.0
+    preprocessor: tile
+    precomputed_dir: null
+    threshold: 0

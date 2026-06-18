@@ -1,45 +1,7 @@
+defaults:
+  - export: flux2_cann
+  - environment: huggingface_mirror
+  - models: flux2_export
+  - _self_
+
 model_key: flux2_klein_base
-
-export:
-  checkpoint_dir: outputs/ablation/local_edit_lora/flux2_klein_base/checkpoint-002000
-  output_root: outputs/export/flux2_klein_base
-  onnx_filename: transformer_denoiser.onnx
-  quantized_onnx_filename: transformer_denoiser.int8.onnx
-  manifest_filename: export_manifest.json
-  batch_size: 1
-  height: 512
-  width: 512
-  max_sequence_length: 512
-  prompt_embed_dim: 7680
-  packed_latent_channels: 128
-  precision: fp16
-  opset: 18
-  lora_scale: 1.0
-  safe_fusing: true
-  quantization:
-    mode: int8_dynamic # none / int8_dynamic / int4_palette
-    per_channel: true
-    reduce_range: false
-  cann:
-    platform: kirin9030
-    output_name: transformer_denoiser
-    omg_path: .cannkit_tools/ddk/tools/tools_omg/omg
-    target: omc
-    input_format: null
-    weight_data_type: FP16
-    convert_om: true
-    fallback_to_fp16: true
-    use_quantized_onnx: false
-    use_shape_stripped_onnx: true
-
-environment:
-  hf_endpoint: https://hf-mirror.com
-  hf_hub_enable_hf_transfer: "1"
-
-models:
-  flux2_klein_base:
-    display_name: FLUX.2 Klein Base 4B
-    pretrained_model_name_or_path: ${oc.env:FLUX2_KLEIN_BASE_PATH,.hf_models/flux2-klein-base-4b}
-    revision: null
-    variant: null
-    local_files_only: true

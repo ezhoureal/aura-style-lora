@@ -1,0 +1,37 @@
+output_root: outputs/ablation/local_edit_lora
+max_train_steps: 2000
+train_batch_size: 2
+gradient_accumulation_steps: 2
+learning_rate: 8e-5
+lr_scheduler: cosine
+lr_warmup_steps: 50
+rank: 16
+lora_alpha: 16
+seed: 42
+mixed_precision: bf16
+gradient_checkpointing: true
+allow_tf32: true
+dataloader_num_workers: 2
+checkpointing_steps: 500
+resume_from_checkpoint: null
+max_grad_norm: 1.0
+guidance_scale: 4.0
+max_sequence_length: 512
+text_encoder_device: cuda
+prompt_embed_batch_size: 2
+text_encoder_out_layers:
+  - 9
+  - 18
+  - 27
+local_files_only: true
+flux2_target_modules:
+  - to_q
+  - to_k
+  - to_v
+  - to_out.0
+  - add_q_proj
+  - add_k_proj
+  - add_v_proj
+  - to_add_out
+sd3_target_modules: ${training.flux2_target_modules}
+sd3_disable_t5: false

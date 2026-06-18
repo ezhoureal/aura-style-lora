@@ -1,0 +1,3 @@
+trigger: "<AURA_STYLE>"
+style_description: "a strong colorful light is illuminating the subject's silhouette. The image is rendered in a smooth gradient of luminous light, giving a radiant and ethereal appearance. Subtle contour lighting highlights delicate outlines, adding depth and a refined, high-end cinematic glow"
+fallback_template: "Render the subject in {trigger} style: {style_description}"

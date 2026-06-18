@@ -1,0 +1,6 @@
+flux2_klein_base:
+  display_name: FLUX.2 Klein Base 4B
+  pretrained_model_name_or_path: ${oc.env:FLUX2_KLEIN_BASE_PATH,.hf_models/flux2-klein-base-4b}
+  revision: null
+  variant: null
+  local_files_only: true

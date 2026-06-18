@@ -5,9 +5,10 @@ photorealistic source image plus a target image in the desired style, and the mo
 to transfer style while preserving identity, composition, pose, silhouette, camera framing,
 and important details.
 
-The active local target is `sd35_medium`, a Stable Diffusion 3.5 Medium paired-edit LoRA.
-Hydra config lives in `configs/local_edit_lora.yaml`; avoid ad hoc CLI argument drift by
-updating that YAML when changing training or eval settings.
+The active local target is controlled by `selected_models` in `configs/local_edit_lora.yaml`.
+Hydra entrypoint configs live at the top of `configs/` and compose reusable groups under
+`configs/dataset`, `configs/models`, `configs/training`, and related folders. Avoid ad hoc
+CLI argument drift by updating those YAML files when changing training or eval settings.
 
 ## Layout
 
@@ -80,7 +81,7 @@ outputs/ablation/local_edit_eval/sd35_medium
 
 ## Notes
 
-- `selected_models` currently contains only `sd35_medium`.
+- `selected_models` currently contains only `sd15`.
 - SD 1.5, SD 2.1, and FLUX.2 trainer code remains in the repo, but the active paired SD3.5
   path is the one currently configured.
 - SD3.5 eval resizes/crops each conditioning image to the configured eval canvas before

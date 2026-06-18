@@ -1,0 +1,9 @@
+base:
+  pretrained_model_name_or_path: ${oc.env:SD15_REALISTIC_MODEL_PATH,.hf_models/realistic-vision-v60-b1-novae}
+  local_files_only: true
+  revision: null
+  variant: null
+vae:
+  pretrained_model_name_or_path: ${oc.env:SD15_VAE_MODEL_PATH,.hf_models/sd-vae-ft-mse}
+  enabled: true
+  local_files_only: true

@@ -1,0 +1,24 @@
+sd15:
+  display_name: Stable Diffusion 1.5
+  pretrained_model_name_or_path: ${oc.env:SD15_MODEL_PATH,.hf_models/sd15}
+  trainer: stable_diffusion_ip2p_lora
+  revision: null
+  prediction_type: null
+  variant: null
+sd21:
+  display_name: Stable Diffusion 2.1
+  pretrained_model_name_or_path: sd2-community/stable-diffusion-2-1
+  trainer: stable_diffusion_ip2p_lora
+  revision: null
+  prediction_type: null
+  variant: fp16
+sd35_medium:
+  display_name: Stable Diffusion 3.5 Medium
+  pretrained_model_name_or_path: ${oc.env:SD35_MEDIUM_MODEL_PATH,.hf_models/sd35-medium}
+  trainer: stable_diffusion_3_paired_edit_lora
+  revision: null
+  variant: null
+flux2_klein_base:
+  display_name: FLUX.2 Klein Base 4B
+  pretrained_model_name_or_path: ${oc.env:FLUX2_KLEIN_BASE_PATH,.hf_models/flux2-klein-base-4b}
+  trainer: flux2_paired_edit_lora
