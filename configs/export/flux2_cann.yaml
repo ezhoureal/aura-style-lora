@@ -14,9 +14,14 @@ opset: 18
 lora_scale: 1.0
 safe_fusing: true
 quantization:
-  mode: int8_dynamic
+  mode: int8_dopt
   per_channel: true
   reduce_range: false
+  dopt_python: ${oc.env:CANN_DOPT_PYTHON,python3}
+  dopt_path: .cannkit_tools/ddk/tools/tools_dopt/dopt_onnx_py3/dopt_so.py
+  calibration_config: null
+  compress_config: null
+  device_idx: 0
 cann:
   platform: kirin9030
   output_name: transformer_denoiser
@@ -26,5 +31,5 @@ cann:
   weight_data_type: FP16
   convert_om: true
   fallback_to_fp16: true
-  use_quantized_onnx: false
+  use_quantized_onnx: true
   use_shape_stripped_onnx: true

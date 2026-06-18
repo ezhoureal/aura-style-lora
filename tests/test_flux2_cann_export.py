@@ -21,12 +21,14 @@ from lora.flux2_cann_export import (
     convert_existing_om,
     conversion_input_path,
     convert_to_om,
+    dopt_command,
     dummy_inputs,
     existing_quantized_model_path,
     expected_om_conversion_model,
     om_conversion_input_path,
     omg_command,
     quantize_onnx,
+    quantization_mode,
     require_omg,
     sanitize_onnx_for_omg,
     shape_from_config,
@@ -106,7 +108,7 @@ class Flux2CannExportManifestTests(unittest.TestCase):
                 "export": {
                     "manifest_filename": "manifest.json",
                     "quantization": {
-                        "mode": "int8_dynamic",
+                        "mode": "int8_dopt",
                         "per_channel": True,
                         "reduce_range": False,
                     },
@@ -151,7 +153,7 @@ class Flux2CannExportManifestTests(unittest.TestCase):
 
         self.assertFalse(manifest["checkpoint_dir"].startswith("/home/"))
         self.assertFalse(manifest["onnx_path"].startswith("/home/"))
-        self.assertEqual(manifest["quantization"]["mode"], "int8_dynamic")
+        self.assertEqual(manifest["quantization"]["mode"], "int8_dopt")
         self.assertIn("--framework=5", manifest["cann_omg_command"])
         self.assertIn("--target=omc", manifest["cann_omg_command"])
         self.assertIn("--platform=kirin9030", manifest["cann_omg_command"])
@@ -262,6 +264,40 @@ class Flux2CannExportManifestTests(unittest.TestCase):
             om_conversion_input_path(cfg, Path("model.onnx"), Path("model.int8.onnx")),
             Path("model.onnx"),
         )
+
+    def test_om_conversion_rejects_onnxruntime_dynamic_int8_for_omg(self) -> None:
+        cfg = OmegaConf.create(
+            {
+                "export": {
+                    "quantization": {"mode": "int8_dynamic"},
+                    "cann": {"use_quantized_onnx": True},
+                }
+            }
+        )
+
+        with self.assertRaisesRegex(ValueError, "DynamicQuantizeLinear/MatMulInteger"):
+            om_conversion_input_path(cfg, Path("model.onnx"), Path("model.int8.onnx"))
+
+    def test_om_conversion_rejects_stale_onnxruntime_dynamic_int8_artifact(self) -> None:
+        cfg = OmegaConf.create(
+            {
+                "export": {
+                    "quantization": {"mode": "int8_dopt"},
+                    "cann": {"use_quantized_onnx": True},
+                }
+            }
+        )
+        input_info = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 2])
+        output_info = helper.make_tensor_value_info("y", TensorProto.INT8, [1, 2])
+        node = helper.make_node("DynamicQuantizeLinear", ["x"], ["y", "scale", "zero"])
+        graph = helper.make_graph([node], "tiny", [input_info], [output_info])
+        model = helper.make_model(graph)
+        with tempfile.TemporaryDirectory(dir=REPO_ROOT) as tmp:
+            quantized_path = Path(tmp) / "model.int8.onnx"
+            onnx.save(model, quantized_path)
+
+            with self.assertRaisesRegex(ValueError, "stale artifact"):
+                om_conversion_input_path(cfg, Path("model.onnx"), quantized_path)
 
     def test_expected_om_conversion_model_uses_shape_stripped_artifact(self) -> None:
         cfg = OmegaConf.create(
@@ -402,7 +438,7 @@ class Flux2CannExportManifestTests(unittest.TestCase):
                         "manifest_filename": "manifest.json",
                         **shape_cfg,
                         "quantization": {
-                            "mode": "int8_dynamic",
+                            "mode": "int8_dopt",
                             "per_channel": True,
                             "reduce_range": False,
                         },
@@ -443,6 +479,86 @@ class Flux2CannExportManifestTests(unittest.TestCase):
 
 
 class Flux2CannQuantizationTests(unittest.TestCase):
+    def test_quantization_mode_defaults_to_none(self) -> None:
+        cfg = OmegaConf.create({"export": {}})
+
+        self.assertEqual(quantization_mode(cfg), "none")
+
+    def test_dopt_command_uses_cann_quantizer_and_static_shapes(self) -> None:
+        cfg = OmegaConf.create(
+            {
+                "export": {
+                    "quantization": {
+                        "mode": "int8_dopt",
+                        "dopt_python": "python3.10",
+                        "dopt_path": "tools/dopt_so.py",
+                        "calibration_config": None,
+                        "compress_config": None,
+                        "device_idx": 2,
+                    }
+                }
+            }
+        )
+        shape = Flux2DenoiserShape(
+            batch_size=1,
+            height=512,
+            width=512,
+            max_sequence_length=512,
+            prompt_embed_dim=7680,
+            packed_latent_channels=128,
+        )
+        with tempfile.TemporaryDirectory(dir=REPO_ROOT) as tmp:
+            output_dir = Path(tmp)
+
+            command = dopt_command(
+                cfg,
+                Path("model.onnx"),
+                output_dir / "model.int8.onnx",
+                output_dir,
+                shape,
+            )
+
+        self.assertEqual(command[0], "python3.10")
+        self.assertIn("--framework", command)
+        self.assertIn("--cal_conf", command)
+        self.assertIn("--compress_conf", command)
+        self.assertTrue(any("hidden_states:1,2048,128" in arg for arg in command))
+        self.assertTrue(any("encoder_hidden_states:1,512,7680" in arg for arg in command))
+        self.assertIn("2", command)
+
+    def test_int8_dopt_quantization_runs_cann_dopt_command(self) -> None:
+        cfg = OmegaConf.create(
+            {
+                "export": {
+                    "quantized_onnx_filename": "model.int8.onnx",
+                    "quantization": {
+                        "mode": "int8_dopt",
+                        "dopt_python": "python3",
+                        "dopt_path": "tools/dopt_so.py",
+                        "calibration_config": None,
+                        "compress_config": None,
+                        "device_idx": 0,
+                    },
+                }
+            }
+        )
+        shape = Flux2DenoiserShape(
+            batch_size=1,
+            height=512,
+            width=512,
+            max_sequence_length=512,
+            prompt_embed_dim=7680,
+            packed_latent_channels=128,
+        )
+        with tempfile.TemporaryDirectory(dir=REPO_ROOT) as tmp:
+            with mock.patch("lora.flux2_cann_export.subprocess.run") as run_mock:
+                quantized_path = quantize_onnx(cfg, Path("model.onnx"), Path(tmp), shape)
+
+        self.assertIsNotNone(quantized_path)
+        self.assertEqual(quantized_path.name, "model.int8.onnx")
+        self.assertEqual(run_mock.call_count, 1)
+        self.assertIn("--model", run_mock.call_args.args[0])
+
     def test_sanitize_onnx_for_omg_removes_reshape_allowzero_attributes(self) -> None:
         input_info = helper.make_tensor_value_info("x", TensorProto.FLOAT, [2])
         output_info = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 2])
@@ -705,7 +821,12 @@ class Flux2CannQuantizationTests(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(NotImplementedError, "target CANN toolchain"):
-            quantize_onnx(cfg, Path("model.onnx"), Path("out"))
+            quantize_onnx(
+                cfg,
+                Path("model.onnx"),
+                Path("out"),
+                Flux2DenoiserShape(1, 512, 512, 512, 7680, 128),
+            )
 
 
 if __name__ == "__main__":

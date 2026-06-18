@@ -37,7 +37,7 @@ ONNX_INPUT_NAMES = [
     "img_ids",
 ]
 ONNX_OUTPUT_NAMES = ["sample"]
-SUPPORTED_QUANTIZATION_MODES = {"none", "int8_dynamic", "int4_palette"}
+SUPPORTED_QUANTIZATION_MODES = {"none", "int8_dynamic", "int8_dopt", "int4_palette"}
 SUPPORTED_CANN_TARGETS = {"om", "omc", "tiny", "ispnn", "security"}
 SANITIZER_EXTERNAL_DATA_MARKER = "lora_flux_omg_sanitized"
 SANITIZER_VERSION = "7"
@@ -299,6 +299,22 @@ def export_onnx(
 
 def quantized_output_path(cfg: DictConfig, output_dir: Path) -> Path:
     return output_dir / str(cfg.export.quantized_onnx_filename)
+
+
+def input_shape_argument(shape: Flux2DenoiserShape) -> str:
+    return ";".join(
+        [
+            f"hidden_states:{shape.batch_size},{shape.denoiser_tokens},{shape.packed_latent_channels}",
+            f"timestep:{shape.batch_size}",
+            f"guidance:{shape.batch_size}",
+            (
+                "encoder_hidden_states:"
+                f"{shape.batch_size},{shape.max_sequence_length},{shape.prompt_embed_dim}"
+            ),
+            f"txt_ids:{shape.batch_size},{shape.max_sequence_length},4",
+            f"img_ids:{shape.batch_size},{shape.denoiser_tokens},4",
+        ]
+    )
 
 
 def remove_external_data_file(onnx_path: Path) -> None:
@@ -618,7 +634,84 @@ def sanitize_onnx_for_omg(onnx_path: Path) -> None:
     )
 
 
-def quantize_onnx(cfg: DictConfig, onnx_path: Path, output_dir: Path) -> Path | None:
+def dopt_calibration_config_path(cfg: DictConfig, output_dir: Path) -> Path:
+    configured = none_if_null(cfg.export.quantization.get("calibration_config"))
+    if configured is not None:
+        return resolve_repo_path(configured)
+    config_path = output_dir / "dopt_int8_calibration.prototxt"
+    config_path.write_text(
+        "\n".join(
+            [
+                "strategy: 'Quant_INT8-8'",
+                "device: USE_CPU",
+                "preprocess_parameter:",
+                "{",
+                "    input_type: BIN",
+                "}",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return config_path
+
+
+def dopt_compress_config_path(cfg: DictConfig, output_dir: Path) -> Path:
+    configured = none_if_null(cfg.export.quantization.get("compress_config"))
+    if configured is not None:
+        return resolve_repo_path(configured)
+    return output_dir / "dopt_int8_params"
+
+
+def dopt_python_executable(cfg: DictConfig) -> str:
+    configured = none_if_null(cfg.export.quantization.get("dopt_python"))
+    if configured is not None:
+        return str(configured)
+    return os.environ.get("CANN_DOPT_PYTHON", "python3")
+
+
+def dopt_executable_path(cfg: DictConfig) -> Path:
+    configured = none_if_null(cfg.export.quantization.get("dopt_path"))
+    if configured is not None:
+        return resolve_repo_path(configured)
+    return resolve_repo_path(".cannkit_tools/ddk/tools/tools_dopt/dopt_onnx_py3/dopt_so.py")
+
+
+def dopt_command(
+    cfg: DictConfig,
+    onnx_path: Path,
+    quantized_path: Path,
+    output_dir: Path,
+    shape: Flux2DenoiserShape,
+) -> list[str]:
+    return [
+        dopt_python_executable(cfg),
+        str(dopt_executable_path(cfg)),
+        "--framework",
+        "5",
+        "-m",
+        "0",
+        "--model",
+        str(onnx_path),
+        "--cal_conf",
+        str(dopt_calibration_config_path(cfg, output_dir)),
+        "--output",
+        str(quantized_path),
+        "--input_shape",
+        input_shape_argument(shape),
+        "--compress_conf",
+        str(dopt_compress_config_path(cfg, output_dir)),
+        "--device_idx",
+        str(int(cfg.export.quantization.get("device_idx", 0))),
+    ]
+
+
+def quantize_onnx(
+    cfg: DictConfig,
+    onnx_path: Path,
+    output_dir: Path,
+    shape: Flux2DenoiserShape,
+) -> Path | None:
     mode = str(cfg.export.quantization.mode)
     if mode not in SUPPORTED_QUANTIZATION_MODES:
         raise ValueError(f"Unsupported quantization mode: {mode}")
@@ -630,6 +723,15 @@ def quantize_onnx(cfg: DictConfig, onnx_path: Path, output_dir: Path) -> Path | 
             "a specific 4-bit ONNX representation. Use export.quantization.mode=int8_dynamic "
             "for the first CANN conversion pass."
         )
+    if mode == "int8_dopt":
+        quantized_path = quantized_output_path(cfg, output_dir)
+        subprocess.run(
+            dopt_command(cfg, onnx_path, quantized_path, output_dir, shape),
+            cwd=REPO_ROOT,
+            check=True,
+            env=cann_subprocess_env(),
+        )
+        return quantized_path
 
     from onnxruntime.quantization import QuantType, quantize_dynamic
 
@@ -675,19 +777,6 @@ def omg_command(
     output_arg = (
         output_base.relative_to(REPO_ROOT) if output_base.is_relative_to(REPO_ROOT) else output_base
     )
-    input_shape = ";".join(
-        [
-            f"hidden_states:{shape.batch_size},{shape.denoiser_tokens},{shape.packed_latent_channels}",
-            f"timestep:{shape.batch_size}",
-            f"guidance:{shape.batch_size}",
-            (
-                "encoder_hidden_states:"
-                f"{shape.batch_size},{shape.max_sequence_length},{shape.prompt_embed_dim}"
-            ),
-            f"txt_ids:{shape.batch_size},{shape.max_sequence_length},4",
-            f"img_ids:{shape.batch_size},{shape.denoiser_tokens},4",
-        ]
-    )
     return [
         str(cann_cfg.omg_path),
         "--framework=5",
@@ -695,7 +784,7 @@ def omg_command(
         f"--output={output_arg}",
         f"--target={cann_target(cfg)}",
         f"--platform={cann_cfg.platform}",
-        f"--input_shape={input_shape}",
+        f"--input_shape={input_shape_argument(shape)}",
         *optional_omg_flag(cfg, "input_format"),
         *optional_omg_flag(cfg, "weight_data_type"),
         *optional_omg_flag(cfg, "input_type"),
@@ -713,8 +802,41 @@ def conversion_input_path(onnx_path: Path, quantized_path: Path | None) -> Path:
     return onnx_path
 
 
+def quantization_mode(cfg: DictConfig) -> str:
+    quantization_cfg = cfg.export.get("quantization")
+    if quantization_cfg is None:
+        return "none"
+    return str(quantization_cfg.get("mode", "none"))
+
+
+def contains_onnxruntime_dynamic_int8_ops(onnx_path: Path) -> bool:
+    if not onnx_path.exists():
+        return False
+    model = onnx.load(onnx_path, load_external_data=False)
+    unsupported_ops = {"DynamicQuantizeLinear", "MatMulInteger"}
+    return any(node.op_type in unsupported_ops for node in model.graph.node)
+
+
+def validate_omg_quantized_input(cfg: DictConfig, quantized_path: Path | None) -> None:
+    if quantized_path is None:
+        return
+    if quantization_mode(cfg) == "int8_dynamic":
+        raise ValueError(
+            "export.quantization.mode=int8_dynamic creates ONNX Runtime "
+            "DynamicQuantizeLinear/MatMulInteger graphs, which this CANN Kit OMG pre-check "
+            "does not support. Use export.quantization.mode=int8_dopt for CANN INT8 OM "
+            "conversion, or set export.cann.use_quantized_onnx=false to convert the FP16 ONNX."
+        )
+    if contains_onnxruntime_dynamic_int8_ops(quantized_path):
+        raise ValueError(
+            f"Existing quantized ONNX contains ONNX Runtime dynamic INT8 operators unsupported "
+            f"by this CANN Kit OMG: {quantized_path}. Remove the stale artifact and regenerate "
+            "with export.quantization.mode=int8_dopt, or set export.cann.use_quantized_onnx=false."
+        )
+
+
 def existing_quantized_model_path(cfg: DictConfig, output_dir: Path) -> Path | None:
-    if str(cfg.export.quantization.mode) == "none":
+    if quantization_mode(cfg) == "none":
         return None
     quantized_path = quantized_output_path(cfg, output_dir)
     if quantized_path.exists():
@@ -724,6 +846,7 @@ def existing_quantized_model_path(cfg: DictConfig, output_dir: Path) -> Path | N
 
 def om_conversion_input_path(cfg: DictConfig, onnx_path: Path, quantized_path: Path | None) -> Path:
     if use_quantized_onnx_for_omg(cfg):
+        validate_omg_quantized_input(cfg, quantized_path)
         return conversion_input_path(onnx_path, quantized_path)
     return onnx_path
 
@@ -900,7 +1023,7 @@ def run(cfg: DictConfig) -> Path:
     onnx_path = output_dir / str(cfg.export.onnx_filename)
     export_onnx(wrapper, inputs, onnx_path, int(cfg.export.opset))
     sanitize_onnx_for_omg(onnx_path)
-    quantized_path = quantize_onnx(cfg, onnx_path, output_dir)
+    quantized_path = quantize_onnx(cfg, onnx_path, output_dir, shape)
     if quantized_path is not None:
         sanitize_onnx_for_omg(quantized_path)
     manifest_path = write_manifest(
@@ -955,6 +1078,8 @@ __all__ = [
     "convert_existing_om",
     "convert_existing_om_main",
     "conversion_input_path",
+    "dopt_command",
+    "dopt_executable_path",
     "existing_quantized_model_path",
     "om_conversion_input_path",
     "prepare_om_conversion_model",
@@ -965,6 +1090,7 @@ __all__ = [
     "load_fused_transformer",
     "main",
     "quantize_onnx",
+    "quantization_mode",
     "omg_command",
     "require_omg",
     "replace_rms_norm_modules",
