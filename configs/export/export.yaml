@@ -1,0 +1,34 @@
+# @package _global_
+
+defaults:
+  - models: flux2
+  - _self_
+
+environment:
+  hf_endpoint: https://hf-mirror.com
+  hf_hub_enable_hf_transfer: "1"
+
+export:
+  output_root: ${models.output_root}
+  onnx_filename: ${models.onnx_filename}
+  quantized_onnx_filename: ${models.quantized_onnx_filename}
+  manifest_filename: export_manifest.json
+  opset: 18
+  quantization:
+    mode: int8_dopt
+    dopt_python: ${oc.env:CANN_DOPT_PYTHON,python3}
+    dopt_path: .cannkit_tools/ddk/tools/tools_dopt/dopt_onnx_py3/dopt_so.py
+    calibration_config: null
+    compress_config: null
+    device_idx: 0
+  cann:
+    platform: kirin9030
+    output_name: ${models.output_name}
+    omg_path: .cannkit_tools/ddk/tools/tools_omg/omg
+    target: omc
+    input_format: null
+    weight_data_type: ${models.weight_data_type}
+    convert_om: true
+    fallback_to_fp16: true
+    use_quantized_onnx: true
+    use_shape_stripped_onnx: true

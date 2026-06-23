@@ -1,7 +1,0 @@
-defaults:
-  - export: flux2_cann
-  - environment: huggingface_mirror
-  - models: flux2_export
-  - _self_
-
-model_key: flux2_klein_base

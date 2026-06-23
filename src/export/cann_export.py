@@ -5,293 +5,56 @@ import os
 import shlex
 import shutil
 import subprocess
-import sys
 from collections import defaultdict
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Mapping, Protocol, Sequence
 
-import torch
 import onnx
+import torch
 from onnx import TensorProto, numpy_helper
-from diffusers.pipelines.pipeline_utils import DiffusionPipeline
-from hydra import compose, initialize_config_dir
 from omegaconf import DictConfig, OmegaConf
 from torch import Tensor, nn
 
-from lora.local_edit_common import (
-    REPO_ROOT,
-    configure_environment,
-    dtype_from_precision,
-    none_if_null,
-    resolve_repo_path,
-)
+from lora.local_edit_common import REPO_ROOT, none_if_null, resolve_repo_path
 
 
-ONNX_INPUT_NAMES = [
-    "hidden_states",
-    "timestep",
-    "guidance",
-    "encoder_hidden_states",
-    "txt_ids",
-    "img_ids",
-]
-ONNX_OUTPUT_NAMES = ["sample"]
-SUPPORTED_QUANTIZATION_MODES = {"none", "int8_dynamic", "int8_dopt", "int4_palette"}
+SUPPORTED_QUANTIZATION_MODES = {"none", "int8_dynamic", "int8_dopt"}
 SUPPORTED_CANN_TARGETS = {"om", "omc", "tiny", "ispnn", "security"}
-SANITIZER_EXTERNAL_DATA_MARKER = "lora_flux_omg_sanitized"
+SANITIZER_EXTERNAL_DATA_MARKER = "cann_omg_sanitized"
 SANITIZER_VERSION = "7"
 MAX_DUPLICATED_INITIALIZER_BYTES = 1024
 
+InputShapes = Mapping[str, Sequence[int]]
 
-@dataclass(frozen=True)
-class Flux2DenoiserShape:
-    batch_size: int
-    height: int
-    width: int
-    max_sequence_length: int
-    prompt_embed_dim: int
-    packed_latent_channels: int
 
+class InputShapeProvider(Protocol):
     @property
-    def packed_latent_tokens(self) -> int:
-        return (self.height // 16) * (self.width // 16)
-
-    @property
-    def denoiser_tokens(self) -> int:
-        return self.packed_latent_tokens * 2
-
-
-def shape_with_transformer_config(
-    shape: Flux2DenoiserShape,
-    transformer: nn.Module,
-) -> Flux2DenoiserShape:
-    transformer_config = cast(Any, transformer).config
-    resolved_shape = Flux2DenoiserShape(
-        batch_size=shape.batch_size,
-        height=shape.height,
-        width=shape.width,
-        max_sequence_length=shape.max_sequence_length,
-        prompt_embed_dim=int(transformer_config.joint_attention_dim),
-        packed_latent_channels=int(transformer_config.in_channels),
-    )
-    validate_shape(resolved_shape)
-    return resolved_shape
+    def input_shapes(self) -> InputShapes: ...
 
 
 @dataclass(frozen=True)
-class Flux2DenoiserInputs:
-    hidden_states: Tensor
-    timestep: Tensor
-    guidance: Tensor
-    encoder_hidden_states: Tensor
-    txt_ids: Tensor
-    img_ids: Tensor
-
-    def as_tuple(self) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
-        return (
-            self.hidden_states,
-            self.timestep,
-            self.guidance,
-            self.encoder_hidden_states,
-            self.txt_ids,
-            self.img_ids,
-        )
+class CannModelSpec:
+    input_names: tuple[str, ...]
+    output_names: tuple[str, ...]
+    input_shapes: InputShapes
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+    model: nn.Module | None = None
+    inputs: tuple[Tensor, ...] = ()
 
 
-class Flux2DenoiserExportWrapper(nn.Module):
-    def __init__(self, transformer: nn.Module) -> None:
-        super().__init__()
-        self.transformer = transformer
-
-    def forward(
-        self,
-        hidden_states: Tensor,
-        timestep: Tensor,
-        guidance: Tensor,
-        encoder_hidden_states: Tensor,
-        txt_ids: Tensor,
-        img_ids: Tensor,
-    ) -> Tensor:
-        result = self.transformer(
-            hidden_states=hidden_states,
-            timestep=timestep,
-            guidance=guidance,
-            encoder_hidden_states=encoder_hidden_states,
-            txt_ids=txt_ids,
-            img_ids=img_ids,
-            return_dict=False,
-        )
-        return cast(Tensor, result[0])
-
-
-class ExportableRMSNorm(nn.Module):
-    def __init__(
-        self,
-        normalized_shape: tuple[int, ...],
-        eps: float,
-        weight: Tensor | None,
-    ) -> None:
-        super().__init__()
-        self.normalized_shape = normalized_shape
-        self.eps = eps
-        if weight is None:
-            self.register_parameter("weight", None)
-        else:
-            self.weight = nn.Parameter(weight.detach().clone())
-
-    def forward(self, hidden_states: Tensor) -> Tensor:
-        variance_dims = tuple(range(-len(self.normalized_shape), 0))
-        variance = hidden_states.to(torch.float32).pow(2).mean(dim=variance_dims, keepdim=True)
-        normalized = hidden_states * torch.rsqrt(variance.to(hidden_states.dtype) + self.eps)
-        if self.weight is None:
-            return normalized
-        return normalized * self.weight
-
-    @classmethod
-    def from_torch_rms_norm(cls, module: nn.RMSNorm) -> ExportableRMSNorm:
-        normalized_shape = cast(
-            tuple[int, ...], tuple(int(value) for value in module.normalized_shape)
-        )
-        weight = cast(Tensor | None, module.weight)
-        eps = torch.finfo(torch.float32).eps if module.eps is None else float(module.eps)
-        return cls(normalized_shape, eps, weight)
-
-
-def replace_rms_norm_modules(module: nn.Module) -> None:
-    for child_name, child in module.named_children():
-        if isinstance(child, nn.RMSNorm):
-            module.add_module(child_name, ExportableRMSNorm.from_torch_rms_norm(child))
-        else:
-            replace_rms_norm_modules(child)
-
-
-def shape_from_config(cfg: DictConfig) -> Flux2DenoiserShape:
-    export_cfg = cfg.export
-    shape = Flux2DenoiserShape(
-        batch_size=int(export_cfg.batch_size),
-        height=int(export_cfg.height),
-        width=int(export_cfg.width),
-        max_sequence_length=int(export_cfg.max_sequence_length),
-        prompt_embed_dim=int(export_cfg.prompt_embed_dim),
-        packed_latent_channels=int(export_cfg.packed_latent_channels),
-    )
-    validate_shape(shape)
-    return shape
-
-
-def validate_shape(shape: Flux2DenoiserShape) -> None:
-    if shape.batch_size < 1:
-        raise ValueError("export.batch_size must be at least 1")
-    if shape.height % 16 != 0 or shape.width % 16 != 0:
-        raise ValueError("export.height and export.width must be divisible by 16")
-    if shape.max_sequence_length < 1:
-        raise ValueError("export.max_sequence_length must be at least 1")
-    if shape.prompt_embed_dim < 1:
-        raise ValueError("export.prompt_embed_dim must be at least 1")
-    if shape.packed_latent_channels < 1:
-        raise ValueError("export.packed_latent_channels must be at least 1")
-
-
-def dummy_inputs(
-    shape: Flux2DenoiserShape, dtype: torch.dtype, device: torch.device
-) -> Flux2DenoiserInputs:
-    return Flux2DenoiserInputs(
-        hidden_states=torch.zeros(
-            shape.batch_size,
-            shape.denoiser_tokens,
-            shape.packed_latent_channels,
-            device=device,
-            dtype=dtype,
-        ),
-        timestep=torch.full((shape.batch_size,), 0.5, device=device, dtype=dtype),
-        guidance=torch.full((shape.batch_size,), 4.0, device=device, dtype=torch.float32),
-        encoder_hidden_states=torch.zeros(
-            shape.batch_size,
-            shape.max_sequence_length,
-            shape.prompt_embed_dim,
-            device=device,
-            dtype=dtype,
-        ),
-        txt_ids=torch.zeros(
-            shape.batch_size,
-            shape.max_sequence_length,
-            4,
-            device=device,
-            dtype=torch.float32,
-        ),
-        img_ids=torch.zeros(
-            shape.batch_size,
-            shape.denoiser_tokens,
-            4,
-            device=device,
-            dtype=torch.float32,
-        ),
-    )
-
-
-def checkpoint_dir_from_config(cfg: DictConfig) -> Path:
-    configured = none_if_null(cfg.export.checkpoint_dir)
-    if configured is not None:
-        return resolve_repo_path(configured)
-    raise ValueError(
-        "export.checkpoint_dir must be set to the LoRA checkpoint directory for CANN export."
-    )
-
-
-def load_fused_transformer(cfg: DictConfig, checkpoint_dir: Path) -> nn.Module:
-    model_cfg = cfg.models[str(cfg.model_key)]
-    dtype = dtype_from_precision(str(cfg.export.precision))
-    load_kwargs: dict[str, Any] = {
-        "torch_dtype": dtype,
-        "low_cpu_mem_usage": True,
-        "local_files_only": bool(model_cfg.get("local_files_only", True)),
-    }
-    revision = none_if_null(model_cfg.get("revision"))
-    variant = none_if_null(model_cfg.get("variant"))
-    if revision is not None:
-        load_kwargs["revision"] = revision
-    if variant is not None:
-        load_kwargs["variant"] = variant
-
-    pipe = DiffusionPipeline.from_pretrained(
-        str(model_cfg.pretrained_model_name_or_path),
-        **load_kwargs,
-    )
-    transformer = cast(Any, pipe.transformer)
-    transformer.load_lora_adapter(
-        str(checkpoint_dir),
-        prefix=None,
-        weight_name="pytorch_lora_weights.safetensors",
-        adapter_name="aura",
-    )
-    transformer.set_adapters(["aura"], weights=[float(cfg.export.lora_scale)])
-    transformer.fuse_lora(
-        lora_scale=float(cfg.export.lora_scale),
-        safe_fusing=bool(cfg.export.safe_fusing),
-        adapter_names=["aura"],
-    )
-    transformer.unload_lora()
-    transformer_module = cast(nn.Module, transformer)
-    replace_rms_norm_modules(transformer_module)
-    return transformer_module
-
-
-def export_onnx(
-    wrapper: Flux2DenoiserExportWrapper,
-    inputs: Flux2DenoiserInputs,
-    output_path: Path,
-    opset: int,
-) -> None:
+def export_onnx(spec: CannModelSpec, output_path: Path, opset: int) -> None:
+    if spec.model is None:
+        raise ValueError("CannModelSpec.model is required for ONNX export")
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    wrapper.eval()
+    spec.model.eval()
     with torch.no_grad():
         torch.onnx.export(
-            wrapper,
-            inputs.as_tuple(),
+            spec.model,
+            spec.inputs,
             output_path,
-            input_names=ONNX_INPUT_NAMES,
-            output_names=ONNX_OUTPUT_NAMES,
+            input_names=list(spec.input_names),
+            output_names=list(spec.output_names),
             opset_version=opset,
             do_constant_folding=True,
         )
@@ -301,19 +64,11 @@ def quantized_output_path(cfg: DictConfig, output_dir: Path) -> Path:
     return output_dir / str(cfg.export.quantized_onnx_filename)
 
 
-def input_shape_argument(shape: Flux2DenoiserShape) -> str:
+def input_shape_argument(model: InputShapeProvider) -> str:
+    shapes = model.input_shapes
     return ";".join(
-        [
-            f"hidden_states:{shape.batch_size},{shape.denoiser_tokens},{shape.packed_latent_channels}",
-            f"timestep:{shape.batch_size}",
-            f"guidance:{shape.batch_size}",
-            (
-                "encoder_hidden_states:"
-                f"{shape.batch_size},{shape.max_sequence_length},{shape.prompt_embed_dim}"
-            ),
-            f"txt_ids:{shape.batch_size},{shape.max_sequence_length},4",
-            f"img_ids:{shape.batch_size},{shape.denoiser_tokens},4",
-        ]
+        f"{name}:{','.join(str(dimension) for dimension in shape)}"
+        for name, shape in shapes.items()
     )
 
 
@@ -561,9 +316,9 @@ def rewrite_double_casts_for_omg(model: onnx.ModelProto) -> None:
             value_info.type.tensor_type.elem_type = TensorProto.FLOAT
 
 
-def sanitize_onnx_for_omg(onnx_path: Path) -> None:
+def sanitize_onnx_for_omg(onnx_path: Path, *, force: bool = False) -> None:
     model = onnx.load(onnx_path, load_external_data=True)
-    if model_is_marked_sanitized(model):
+    if model_is_marked_sanitized(model) and not force:
         return
     initializer_names = {initializer.name for initializer in model.graph.initializer}
     for initializer in model.graph.initializer:
@@ -682,7 +437,7 @@ def dopt_command(
     onnx_path: Path,
     quantized_path: Path,
     output_dir: Path,
-    shape: Flux2DenoiserShape,
+    model: InputShapeProvider,
 ) -> list[str]:
     return [
         dopt_python_executable(cfg),
@@ -698,7 +453,7 @@ def dopt_command(
         "--output",
         str(quantized_path),
         "--input_shape",
-        input_shape_argument(shape),
+        input_shape_argument(model),
         "--compress_conf",
         str(dopt_compress_config_path(cfg, output_dir)),
         "--device_idx",
@@ -710,23 +465,17 @@ def quantize_onnx(
     cfg: DictConfig,
     onnx_path: Path,
     output_dir: Path,
-    shape: Flux2DenoiserShape,
+    model: InputShapeProvider,
 ) -> Path | None:
     mode = str(cfg.export.quantization.mode)
     if mode not in SUPPORTED_QUANTIZATION_MODES:
         raise ValueError(f"Unsupported quantization mode: {mode}")
     if mode == "none":
         return None
-    if mode == "int4_palette":
-        raise NotImplementedError(
-            "int4_palette is intentionally gated until the target CANN toolchain accepts "
-            "a specific 4-bit ONNX representation. Use export.quantization.mode=int8_dynamic "
-            "for the first CANN conversion pass."
-        )
     if mode == "int8_dopt":
         quantized_path = quantized_output_path(cfg, output_dir)
         subprocess.run(
-            dopt_command(cfg, onnx_path, quantized_path, output_dir, shape),
+            dopt_command(cfg, onnx_path, quantized_path, output_dir, model),
             cwd=REPO_ROOT,
             check=True,
             env=cann_subprocess_env(),
@@ -740,8 +489,8 @@ def quantize_onnx(
     quantize_dynamic(
         model_input=str(quantization_input),
         model_output=str(quantized_path),
-        per_channel=bool(cfg.export.quantization.per_channel),
-        reduce_range=bool(cfg.export.quantization.reduce_range),
+        per_channel=bool(cfg.export.quantization.get("per_channel", True)),
+        reduce_range=bool(cfg.export.quantization.get("reduce_range", False)),
         weight_type=QuantType.QInt8,
         use_external_data_format=True,
     )
@@ -767,7 +516,7 @@ def optional_omg_flag(cfg: DictConfig, key: str) -> list[str]:
 
 
 def omg_command(
-    cfg: DictConfig, onnx_path: Path, shape: Flux2DenoiserShape, output_dir: Path
+    cfg: DictConfig, onnx_path: Path, model: InputShapeProvider, output_dir: Path
 ) -> list[str]:
     cann_cfg = cfg.export.cann
     output_base = output_dir / str(cann_cfg.output_name)
@@ -784,7 +533,7 @@ def omg_command(
         f"--output={output_arg}",
         f"--target={cann_target(cfg)}",
         f"--platform={cann_cfg.platform}",
-        f"--input_shape={input_shape_argument(shape)}",
+        f"--input_shape={input_shape_argument(model)}",
         *optional_omg_flag(cfg, "input_format"),
         *optional_omg_flag(cfg, "weight_data_type"),
         *optional_omg_flag(cfg, "input_type"),
@@ -794,12 +543,6 @@ def omg_command(
 
 def om_output_path(cfg: DictConfig, output_dir: Path) -> Path:
     return output_dir / f"{cfg.export.cann.output_name}.{cann_target(cfg)}"
-
-
-def conversion_input_path(onnx_path: Path, quantized_path: Path | None) -> Path:
-    if quantized_path is not None:
-        return quantized_path
-    return onnx_path
 
 
 def quantization_mode(cfg: DictConfig) -> str:
@@ -835,19 +578,10 @@ def validate_omg_quantized_input(cfg: DictConfig, quantized_path: Path | None) -
         )
 
 
-def existing_quantized_model_path(cfg: DictConfig, output_dir: Path) -> Path | None:
-    if quantization_mode(cfg) == "none":
-        return None
-    quantized_path = quantized_output_path(cfg, output_dir)
-    if quantized_path.exists():
-        return quantized_path
-    return None
-
-
 def om_conversion_input_path(cfg: DictConfig, onnx_path: Path, quantized_path: Path | None) -> Path:
     if use_quantized_onnx_for_omg(cfg):
         validate_omg_quantized_input(cfg, quantized_path)
-        return conversion_input_path(onnx_path, quantized_path)
+        return onnx_path if quantized_path is None else quantized_path
     return onnx_path
 
 
@@ -859,19 +593,8 @@ def prepare_om_conversion_model(cfg: DictConfig, onnx_path: Path, output_dir: Pa
     return stripped_path
 
 
-def expected_om_conversion_model(
-    cfg: DictConfig, onnx_path: Path, quantized_path: Path | None, output_dir: Path
-) -> Path:
-    conversion_model = om_conversion_input_path(cfg, onnx_path, quantized_path)
-    if conversion_model != onnx_path or not bool(
-        cfg.export.cann.get("use_shape_stripped_onnx", False)
-    ):
-        return conversion_model
-    return output_dir / f"{onnx_path.stem}.shape_stripped{onnx_path.suffix}"
-
-
 def require_omg(omg_path: str) -> str:
-    configured_path = Path(omg_path)
+    configured_path = resolve_repo_path(omg_path)
     resolved: str | None
     if configured_path.exists():
         resolved = str(configured_path)
@@ -890,7 +613,7 @@ def cann_env_script(cfg: DictConfig) -> Path | None:
     configured = none_if_null(cfg.export.cann.get("env_script"))
     if configured is not None:
         return resolve_repo_path(configured)
-    omg_path = Path(str(cfg.export.cann.omg_path))
+    omg_path = resolve_repo_path(str(cfg.export.cann.omg_path))
     ddk_tools_path = omg_path.parents[1] if len(omg_path.parents) > 1 else Path("tools")
     candidate = ddk_tools_path / "tools_ascendc" / "set_ascendc_env.sh"
     if candidate.exists():
@@ -925,14 +648,14 @@ def convert_to_om(
     cfg: DictConfig,
     onnx_path: Path,
     quantized_path: Path | None,
-    shape: Flux2DenoiserShape,
+    model: InputShapeProvider,
     output_dir: Path,
-) -> Path:
+) -> tuple[Path, Path]:
     omg_executable = require_omg(str(cfg.export.cann.omg_path))
     conversion_model = om_conversion_input_path(cfg, onnx_path, quantized_path)
     if conversion_model == onnx_path:
         conversion_model = prepare_om_conversion_model(cfg, onnx_path, output_dir)
-    command = omg_command(cfg, conversion_model, shape, output_dir)
+    command = omg_command(cfg, conversion_model, model, output_dir)
     command[0] = omg_executable
     try:
         subprocess.run(
@@ -948,14 +671,8 @@ def convert_to_om(
             or not bool(cfg.export.cann.fallback_to_fp16)
         ):
             raise
-        fp16_command = omg_command(cfg, onnx_path, shape, output_dir)
-        if bool(cfg.export.cann.get("use_shape_stripped_onnx", False)):
-            fp16_command = omg_command(
-                cfg,
-                prepare_om_conversion_model(cfg, onnx_path, output_dir),
-                shape,
-                output_dir,
-            )
+        conversion_model = prepare_om_conversion_model(cfg, onnx_path, output_dir)
+        fp16_command = omg_command(cfg, conversion_model, model, output_dir)
         fp16_command[0] = omg_executable
         subprocess.run(
             command_with_cann_env(cfg, fp16_command),
@@ -963,142 +680,59 @@ def convert_to_om(
             check=True,
             env=cann_subprocess_env(),
         )
-    return om_output_path(cfg, output_dir)
+    return om_output_path(cfg, output_dir), conversion_model
+
+
+def relative_path(path: Path) -> str:
+    return str(path.relative_to(REPO_ROOT)) if path.is_relative_to(REPO_ROOT) else str(path)
 
 
 def write_manifest(
     cfg: DictConfig,
     output_dir: Path,
-    checkpoint_dir: Path,
     onnx_path: Path,
     quantized_path: Path | None,
-    shape: Flux2DenoiserShape,
+    spec: CannModelSpec,
+    om_path: Path | None,
+    conversion_model: Path | None,
 ) -> Path:
     manifest_path = output_dir / str(cfg.export.manifest_filename)
     manifest = {
-        "model_key": str(cfg.model_key),
-        "checkpoint_dir": str(checkpoint_dir.relative_to(REPO_ROOT))
-        if checkpoint_dir.is_relative_to(REPO_ROOT)
-        else str(checkpoint_dir),
-        "onnx_path": str(onnx_path.relative_to(REPO_ROOT))
-        if onnx_path.is_relative_to(REPO_ROOT)
-        else str(onnx_path),
-        "quantized_onnx_path": None
-        if quantized_path is None
-        else (
-            str(quantized_path.relative_to(REPO_ROOT))
-            if quantized_path.is_relative_to(REPO_ROOT)
-            else str(quantized_path)
+        **spec.metadata,
+        "onnx_path": relative_path(onnx_path),
+        "quantized_onnx_path": (None if quantized_path is None else relative_path(quantized_path)),
+        "input_names": list(spec.input_names),
+        "output_names": list(spec.output_names),
+        "quantization": OmegaConf.to_container(cfg.export.get("quantization", {}), resolve=True),
+        "cann_omg_command": (
+            None
+            if conversion_model is None
+            else omg_command(cfg, conversion_model, spec, output_dir)
         ),
-        "shape": asdict(shape),
-        "input_names": ONNX_INPUT_NAMES,
-        "output_names": ONNX_OUTPUT_NAMES,
-        "quantization": OmegaConf.to_container(cfg.export.quantization, resolve=True),
-        "cann_omg_command": omg_command(
-            cfg,
-            expected_om_conversion_model(cfg, onnx_path, quantized_path, output_dir),
-            shape,
-            output_dir,
-        ),
-        "om_path": str(om_output_path(cfg, output_dir).relative_to(REPO_ROOT))
-        if om_output_path(cfg, output_dir).is_relative_to(REPO_ROOT)
-        else str(om_output_path(cfg, output_dir)),
-        "lora_fused": True,
+        "om_path": None if om_path is None else relative_path(om_path),
     }
     with manifest_path.open("w", encoding="utf-8") as handle:
         json.dump(manifest, handle, indent=2)
     return manifest_path
 
 
-def run(cfg: DictConfig) -> Path:
-    configure_environment(cfg)
-    output_dir = resolve_repo_path(str(cfg.export.output_root))
-    checkpoint_dir = checkpoint_dir_from_config(cfg)
-    dtype = dtype_from_precision(str(cfg.export.precision))
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    transformer = load_fused_transformer(cfg, checkpoint_dir).to(device)
-    shape = shape_with_transformer_config(shape_from_config(cfg), transformer)
-    wrapper = Flux2DenoiserExportWrapper(transformer)
-    inputs = dummy_inputs(shape, dtype, device)
+def run_export_pipeline(cfg: DictConfig, output_dir: Path, spec: CannModelSpec) -> Path:
     onnx_path = output_dir / str(cfg.export.onnx_filename)
-    export_onnx(wrapper, inputs, onnx_path, int(cfg.export.opset))
+    export_onnx(spec, onnx_path, int(cfg.export.opset))
     sanitize_onnx_for_omg(onnx_path)
-    quantized_path = quantize_onnx(cfg, onnx_path, output_dir, shape)
+    quantized_path = quantize_onnx(cfg, onnx_path, output_dir, spec)
     if quantized_path is not None:
-        sanitize_onnx_for_omg(quantized_path)
-    manifest_path = write_manifest(
-        cfg, output_dir, checkpoint_dir, onnx_path, quantized_path, shape
-    )
+        sanitize_onnx_for_omg(quantized_path, force=True)
+    om_path: Path | None = None
+    conversion_model: Path | None = None
     if bool(cfg.export.cann.convert_om):
-        convert_to_om(cfg, onnx_path, quantized_path, shape, output_dir)
-    return manifest_path
-
-
-def convert_existing_om(cfg: DictConfig) -> Path:
-    output_dir = resolve_repo_path(str(cfg.export.output_root))
-    onnx_path = output_dir / str(cfg.export.onnx_filename)
-    if not onnx_path.exists():
-        raise FileNotFoundError(f"Missing exported ONNX model: {onnx_path}")
-    quantized_model = existing_quantized_model_path(cfg, output_dir)
-    sanitize_onnx_for_omg(onnx_path)
-    if quantized_model is not None:
-        sanitize_onnx_for_omg(quantized_model)
-    shape = shape_from_config(cfg)
-    checkpoint_dir = checkpoint_dir_from_config(cfg)
-    write_manifest(cfg, output_dir, checkpoint_dir, onnx_path, quantized_model, shape)
-    return convert_to_om(cfg, onnx_path, quantized_model, shape, output_dir)
-
-
-def main() -> None:
-    with initialize_config_dir(config_dir=str(REPO_ROOT / "configs"), version_base=None):
-        cfg = compose(config_name="export_flux2_cann", overrides=sys.argv[1:])
-    manifest_path = run(cfg)
-    print(json.dumps({"manifest": str(manifest_path)}, indent=2))
-
-
-def convert_existing_om_main() -> None:
-    with initialize_config_dir(config_dir=str(REPO_ROOT / "configs"), version_base=None):
-        cfg = compose(config_name="export_flux2_cann", overrides=sys.argv[1:])
-    try:
-        om_path = convert_existing_om(cfg)
-    except FileNotFoundError as error:
-        print(str(error), file=sys.stderr)
-        raise SystemExit(1) from error
-    print(json.dumps({"om": str(om_path)}, indent=2))
-
-
-__all__ = [
-    "Flux2DenoiserExportWrapper",
-    "Flux2DenoiserInputs",
-    "Flux2DenoiserShape",
-    "ONNX_INPUT_NAMES",
-    "ONNX_OUTPUT_NAMES",
-    "ExportableRMSNorm",
-    "checkpoint_dir_from_config",
-    "convert_existing_om",
-    "convert_existing_om_main",
-    "conversion_input_path",
-    "dopt_command",
-    "dopt_executable_path",
-    "existing_quantized_model_path",
-    "om_conversion_input_path",
-    "prepare_om_conversion_model",
-    "expected_om_conversion_model",
-    "convert_to_om",
-    "dummy_inputs",
-    "export_onnx",
-    "load_fused_transformer",
-    "main",
-    "quantize_onnx",
-    "quantization_mode",
-    "omg_command",
-    "require_omg",
-    "replace_rms_norm_modules",
-    "run",
-    "sanitize_onnx_for_omg",
-    "shape_from_config",
-    "shape_with_transformer_config",
-    "strip_intermediate_value_info",
-    "validate_shape",
-    "write_manifest",
-]
+        om_path, conversion_model = convert_to_om(cfg, onnx_path, quantized_path, spec, output_dir)
+    return write_manifest(
+        cfg,
+        output_dir,
+        onnx_path,
+        quantized_path,
+        spec,
+        om_path,
+        conversion_model,
+    )

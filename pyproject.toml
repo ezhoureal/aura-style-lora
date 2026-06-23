@@ -1,7 +1,7 @@
 [project]
 name = "lora"
 version = "0.1.0"
-description = "Local tooling for preparing and training a FLUX-dev LoRA."
+description = "Tools for preparing and training a style transfer LoRA on image generation models."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -21,6 +21,7 @@ dependencies = [
     "tqdm>=4.66.0",
     "transformers>=4.41.2",
     "sentencepiece",
+    "s3od @ git+https://github.com/KupynOrest/s3od.git",
     "tensorboard",
     "bitsandbytes>=0.49.2",
     "protobuf>=7.35.0",

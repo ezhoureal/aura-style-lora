@@ -5,6 +5,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -13,28 +14,30 @@ from onnx import TensorProto, helper
 from torch import nn
 from omegaconf import OmegaConf
 
-from lora.flux2_cann_export import (
-    ExportableRMSNorm,
-    Flux2DenoiserShape,
+from export.cann_export import (
     cann_target,
-    checkpoint_dir_from_config,
-    convert_existing_om,
-    conversion_input_path,
     convert_to_om,
     dopt_command,
-    dummy_inputs,
-    existing_quantized_model_path,
-    expected_om_conversion_model,
+    mark_model_sanitized,
     om_conversion_input_path,
     omg_command,
     quantize_onnx,
     quantization_mode,
     require_omg,
     sanitize_onnx_for_omg,
-    shape_from_config,
     static_shapes,
     strip_intermediate_value_info,
     write_manifest,
+)
+from export.flux2_cann_export import (
+    ExportableRMSNorm,
+    Flux2DenoiserShape,
+    checkpoint_dir_from_config,
+    dummy_inputs,
+    flux2_manifest_metadata,
+    flux2_model_spec,
+    load_fused_transformer,
+    shape_from_config,
 )
 from lora.local_edit_common import REPO_ROOT
 
@@ -50,21 +53,29 @@ class Flux2CannExportShapeTests(unittest.TestCase):
 
         self.assertTrue(torch.allclose(actual, expected, atol=1e-5, rtol=1e-5))
 
+    def test_exportable_rms_norm_keeps_fp32_variance_for_fp16_inputs(self) -> None:
+        torch_norm = nn.RMSNorm(128, eps=1e-6).to(torch.float16)
+        export_norm = ExportableRMSNorm.from_torch_rms_norm(torch_norm)
+        hidden_states = torch.full((2, 128), 1000, dtype=torch.float16)
+
+        self.assertTrue(torch.equal(export_norm(hidden_states), torch_norm(hidden_states)))
+
     def test_shape_contract_matches_packed_flux2_edit_inputs(self) -> None:
         cfg = OmegaConf.create(
             {
-                "export": {
+                "models": {
                     "batch_size": 1,
                     "height": 512,
                     "width": 512,
                     "max_sequence_length": 512,
-                    "prompt_embed_dim": 7680,
-                    "packed_latent_channels": 128,
                 }
             }
         )
 
-        shape = shape_from_config(cfg)
+        transformer = mock.Mock()
+        transformer.config.joint_attention_dim = 7680
+        transformer.config.in_channels = 128
+        shape = shape_from_config(cfg, transformer)
         inputs = dummy_inputs(shape, torch.float16, torch.device("cpu"))
 
         self.assertEqual(shape.packed_latent_tokens, 1024)
@@ -79,32 +90,65 @@ class Flux2CannExportShapeTests(unittest.TestCase):
     def test_shape_rejects_non_flux_latent_multiple(self) -> None:
         cfg = OmegaConf.create(
             {
-                "export": {
+                "models": {
                     "batch_size": 1,
                     "height": 510,
                     "width": 512,
                     "max_sequence_length": 512,
-                    "prompt_embed_dim": 4096,
-                    "packed_latent_channels": 64,
                 }
             }
         )
 
         with self.assertRaisesRegex(ValueError, "divisible by 16"):
-            shape_from_config(cfg)
+            transformer = mock.Mock()
+            transformer.config.joint_attention_dim = 4096
+            transformer.config.in_channels = 64
+            shape_from_config(cfg, transformer)
 
 
 class Flux2CannExportManifestTests(unittest.TestCase):
     def test_checkpoint_dir_must_be_configured(self) -> None:
-        cfg = OmegaConf.create({"export": {"checkpoint_dir": None}})
+        cfg = OmegaConf.create({"models": {"checkpoint_dir": None}})
 
-        with self.assertRaisesRegex(ValueError, "export.checkpoint_dir"):
+        with self.assertRaisesRegex(ValueError, "models.checkpoint_dir"):
             checkpoint_dir_from_config(cfg)
+
+    def test_lora_scale_is_applied_once_when_fusing(self) -> None:
+        transformer = nn.Module()
+        transformer.config = SimpleNamespace()
+        transformer.load_lora_adapter = mock.Mock()
+        transformer.fuse_lora = mock.Mock()
+        transformer.unload_lora = mock.Mock()
+        cfg = OmegaConf.create(
+            {
+                "models": {
+                    "precision": "fp16",
+                    "pretrained_model_name_or_path": "model",
+                    "local_files_only": True,
+                    "revision": None,
+                    "variant": None,
+                    "lora_scale": 0.5,
+                    "safe_fusing": True,
+                }
+            }
+        )
+        pipe = SimpleNamespace(transformer=transformer)
+
+        with mock.patch(
+            "export.flux2_cann_export.DiffusionPipeline.from_pretrained", return_value=pipe
+        ):
+            load_fused_transformer(cfg, Path("checkpoint"))
+
+        transformer.fuse_lora.assert_called_once_with(
+            lora_scale=0.5,
+            safe_fusing=True,
+            adapter_names=["aura"],
+        )
 
     def test_manifest_records_relative_paths_and_omg_command(self) -> None:
         cfg = OmegaConf.create(
             {
-                "model_key": "flux2_klein_base",
+                "models": {"name": "flux2_klein_base"},
                 "export": {
                     "manifest_filename": "manifest.json",
                     "quantization": {
@@ -140,13 +184,18 @@ class Flux2CannExportManifestTests(unittest.TestCase):
             onnx_path = output_dir / "transformer.onnx"
             quantized_path = output_dir / "transformer.int8.onnx"
 
+            spec = flux2_model_spec(
+                shape,
+                metadata=flux2_manifest_metadata(cfg, checkpoint_dir, shape),
+            )
             manifest_path = write_manifest(
                 cfg,
                 output_dir,
-                checkpoint_dir,
                 onnx_path,
                 quantized_path,
-                shape,
+                spec,
+                output_dir / "transformer_denoiser.omc",
+                quantized_path,
             )
 
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -200,7 +249,7 @@ class Flux2CannExportManifestTests(unittest.TestCase):
     def test_manifest_records_fp16_omg_input_when_quantized_conversion_is_disabled(self) -> None:
         cfg = OmegaConf.create(
             {
-                "model_key": "flux2_klein_base",
+                "models": {"name": "flux2_klein_base"},
                 "export": {
                     "manifest_filename": "manifest.json",
                     "quantization": {
@@ -231,31 +280,59 @@ class Flux2CannExportManifestTests(unittest.TestCase):
             output_dir.mkdir()
             checkpoint_dir = Path(tmp) / "checkpoint-000001"
             checkpoint_dir.mkdir()
+            spec = flux2_model_spec(
+                shape,
+                metadata=flux2_manifest_metadata(cfg, checkpoint_dir, shape),
+            )
             manifest_path = write_manifest(
                 cfg,
                 output_dir,
-                checkpoint_dir,
                 output_dir / "transformer.onnx",
                 output_dir / "transformer.int8.onnx",
-                shape,
+                spec,
+                output_dir / "transformer_denoiser.omc",
+                output_dir / "transformer.onnx",
             )
 
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
         self.assertTrue(manifest["cann_omg_command"][2].endswith("transformer.onnx"))
 
+    def test_manifest_does_not_claim_om_output_when_conversion_is_disabled(self) -> None:
+        cfg = OmegaConf.create(
+            {
+                "export": {
+                    "manifest_filename": "manifest.json",
+                    "quantization": {"mode": "none"},
+                    "cann": {
+                        "platform": "kirin9030",
+                        "output_name": "model",
+                        "omg_path": "omg",
+                    },
+                }
+            }
+        )
+        spec = flux2_model_spec(Flux2DenoiserShape(1, 512, 512, 512, 7680, 128))
+        with tempfile.TemporaryDirectory(dir=REPO_ROOT) as tmp:
+            manifest_path = write_manifest(
+                cfg,
+                Path(tmp),
+                Path(tmp) / "model.onnx",
+                None,
+                spec,
+                None,
+                None,
+            )
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+        self.assertIsNone(manifest["cann_omg_command"])
+        self.assertIsNone(manifest["om_path"])
+
     def test_cann_target_rejects_unknown_target(self) -> None:
         cfg = OmegaConf.create({"export": {"cann": {"target": "bad_target"}}})
 
         with self.assertRaisesRegex(ValueError, "Unsupported CANN target"):
             cann_target(cfg)
-
-    def test_conversion_prefers_quantized_model_when_available(self) -> None:
-        self.assertEqual(
-            conversion_input_path(Path("model.onnx"), Path("model.int8.onnx")),
-            Path("model.int8.onnx"),
-        )
-        self.assertEqual(conversion_input_path(Path("model.onnx"), None), Path("model.onnx"))
 
     def test_om_conversion_can_skip_quantized_model_for_mobile_omg(self) -> None:
         cfg = OmegaConf.create({"export": {"cann": {"use_quantized_onnx": False}}})
@@ -299,27 +376,16 @@ class Flux2CannExportManifestTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "stale artifact"):
                 om_conversion_input_path(cfg, Path("model.onnx"), quantized_path)
 
-    def test_expected_om_conversion_model_uses_shape_stripped_artifact(self) -> None:
-        cfg = OmegaConf.create(
-            {
-                "export": {
-                    "cann": {
-                        "use_quantized_onnx": False,
-                        "use_shape_stripped_onnx": True,
-                    }
-                }
-            }
-        )
-
-        self.assertEqual(
-            expected_om_conversion_model(cfg, Path("model.onnx"), None, Path("out")),
-            Path("out/model.shape_stripped.onnx"),
-        )
-
     def test_require_omg_reports_missing_toolchain(self) -> None:
-        with mock.patch("lora.flux2_cann_export.shutil.which", return_value=None):
+        with mock.patch("export.cann_export.shutil.which", return_value=None):
             with self.assertRaisesRegex(FileNotFoundError, "CANN Kit OMG executable"):
                 require_omg("omg")
+
+    def test_require_omg_resolves_repository_relative_path(self) -> None:
+        tool = REPO_ROOT / "tools" / "omg"
+        with mock.patch("export.cann_export.resolve_repo_path", return_value=tool):
+            with mock.patch.object(Path, "exists", return_value=True):
+                self.assertEqual(require_omg("tools/omg"), str(tool))
 
     def test_convert_to_om_falls_back_to_fp16_when_quantized_omg_fails(self) -> None:
         cfg = OmegaConf.create(
@@ -347,16 +413,16 @@ class Flux2CannExportManifestTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=REPO_ROOT) as tmp:
             output_dir = Path(tmp)
             with (
-                mock.patch("lora.flux2_cann_export.require_omg", return_value="/opt/omg"),
-                mock.patch("lora.flux2_cann_export.cann_env_script", return_value=None),
-                mock.patch("lora.flux2_cann_export.subprocess.run") as run_mock,
+                mock.patch("export.cann_export.require_omg", return_value="/opt/omg"),
+                mock.patch("export.cann_export.cann_env_script", return_value=None),
+                mock.patch("export.cann_export.subprocess.run") as run_mock,
             ):
                 run_mock.side_effect = [
                     subprocess.CalledProcessError(1, ["omg"]),
                     subprocess.CompletedProcess(["omg"], 0),
                 ]
 
-                om_path = convert_to_om(
+                om_path, conversion_model = convert_to_om(
                     cfg,
                     Path("model.onnx"),
                     Path("model.int8.onnx"),
@@ -365,6 +431,7 @@ class Flux2CannExportManifestTests(unittest.TestCase):
                 )
 
         self.assertEqual(om_path.name, "transformer_denoiser.omc")
+        self.assertEqual(conversion_model, Path("model.onnx"))
         self.assertEqual(run_mock.call_count, 2)
         self.assertIn("--model=model.int8.onnx", run_mock.call_args_list[0].args[0])
         self.assertIn("--model=model.onnx", run_mock.call_args_list[1].args[0])
@@ -395,9 +462,9 @@ class Flux2CannExportManifestTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory(dir=REPO_ROOT) as tmp:
             with (
-                mock.patch("lora.flux2_cann_export.require_omg", return_value="/opt/omg"),
-                mock.patch("lora.flux2_cann_export.cann_env_script", return_value=None),
-                mock.patch("lora.flux2_cann_export.subprocess.run") as run_mock,
+                mock.patch("export.cann_export.require_omg", return_value="/opt/omg"),
+                mock.patch("export.cann_export.cann_env_script", return_value=None),
+                mock.patch("export.cann_export.subprocess.run") as run_mock,
             ):
                 convert_to_om(
                     cfg,
@@ -409,73 +476,6 @@ class Flux2CannExportManifestTests(unittest.TestCase):
 
         self.assertEqual(run_mock.call_count, 1)
         self.assertIn("--model=model.onnx", run_mock.call_args.args[0])
-
-    def test_convert_existing_om_uses_existing_quantized_artifact(self) -> None:
-        shape_cfg = {
-            "batch_size": 1,
-            "height": 512,
-            "width": 512,
-            "max_sequence_length": 512,
-            "prompt_embed_dim": 7680,
-            "packed_latent_channels": 128,
-        }
-        with tempfile.TemporaryDirectory(dir=REPO_ROOT) as tmp:
-            root = Path(tmp)
-            output_dir = root / "export"
-            checkpoint_dir = root / "checkpoint-000001"
-            output_dir.mkdir()
-            checkpoint_dir.mkdir()
-            (output_dir / "transformer.onnx").touch()
-            (output_dir / "transformer.int8.onnx").touch()
-            cfg = OmegaConf.create(
-                {
-                    "model_key": "flux2_klein_base",
-                    "export": {
-                        "checkpoint_dir": str(checkpoint_dir.relative_to(REPO_ROOT)),
-                        "output_root": str(output_dir.relative_to(REPO_ROOT)),
-                        "onnx_filename": "transformer.onnx",
-                        "quantized_onnx_filename": "transformer.int8.onnx",
-                        "manifest_filename": "manifest.json",
-                        **shape_cfg,
-                        "quantization": {
-                            "mode": "int8_dopt",
-                            "per_channel": True,
-                            "reduce_range": False,
-                        },
-                        "cann": {
-                            "platform": "kirin9030",
-                            "output_name": "transformer_denoiser",
-                            "omg_path": "omg",
-                            "target": "omc",
-                            "fallback_to_fp16": True,
-                        },
-                    },
-                }
-            )
-
-            with mock.patch(
-                "lora.flux2_cann_export.convert_to_om",
-                return_value=output_dir / "transformer_denoiser.omc",
-            ) as convert_mock:
-                om_path = convert_existing_om(cfg)
-
-        self.assertEqual(om_path.name, "transformer_denoiser.omc")
-        self.assertEqual(convert_mock.call_args.args[2].name, "transformer.int8.onnx")
-
-    def test_existing_quantized_model_is_ignored_when_quantization_is_disabled(self) -> None:
-        cfg = OmegaConf.create(
-            {
-                "export": {
-                    "quantized_onnx_filename": "transformer.int8.onnx",
-                    "quantization": {"mode": "none"},
-                }
-            }
-        )
-        with tempfile.TemporaryDirectory(dir=REPO_ROOT) as tmp:
-            output_dir = Path(tmp)
-            (output_dir / "transformer.int8.onnx").touch()
-
-            self.assertIsNone(existing_quantized_model_path(cfg, output_dir))
 
 
 class Flux2CannQuantizationTests(unittest.TestCase):
@@ -551,10 +551,11 @@ class Flux2CannQuantizationTests(unittest.TestCase):
             packed_latent_channels=128,
         )
         with tempfile.TemporaryDirectory(dir=REPO_ROOT) as tmp:
-            with mock.patch("lora.flux2_cann_export.subprocess.run") as run_mock:
+            with mock.patch("export.cann_export.subprocess.run") as run_mock:
                 quantized_path = quantize_onnx(cfg, Path("model.onnx"), Path(tmp), shape)
 
         self.assertIsNotNone(quantized_path)
+        assert quantized_path is not None
         self.assertEqual(quantized_path.name, "model.int8.onnx")
         self.assertEqual(run_mock.call_count, 1)
         self.assertIn("--model", run_mock.call_args.args[0])
@@ -621,6 +622,24 @@ class Flux2CannQuantizationTests(unittest.TestCase):
         )
         self.assertEqual(cast_to, TensorProto.FLOAT)
         self.assertEqual(sanitized.graph.output[0].type.tensor_type.elem_type, TensorProto.FLOAT)
+
+    def test_force_sanitize_processes_a_marked_derived_model(self) -> None:
+        input_info = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1])
+        output_info = helper.make_tensor_value_info("y", TensorProto.DOUBLE, [1])
+        node = helper.make_node("Cast", ["x"], ["y"], to=TensorProto.DOUBLE)
+        model = helper.make_model(helper.make_graph([node], "tiny", [input_info], [output_info]))
+        mark_model_sanitized(model)
+        with tempfile.TemporaryDirectory(dir=REPO_ROOT) as tmp:
+            model_path = Path(tmp) / "derived.onnx"
+            onnx.save(model, model_path)
+
+            sanitize_onnx_for_omg(model_path, force=True)
+            sanitized = onnx.load(model_path)
+
+        cast_to = next(
+            attribute.i for attribute in sanitized.graph.node[0].attribute if attribute.name == "to"
+        )
+        self.assertEqual(cast_to, TensorProto.FLOAT)
 
     def test_sanitize_onnx_for_omg_adds_layer_norm_bias(self) -> None:
         input_info = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 2])
@@ -806,7 +825,7 @@ class Flux2CannQuantizationTests(unittest.TestCase):
         self.assertEqual(stripped.graph.input[0].name, "x")
         self.assertEqual(stripped.graph.output[0].name, "y")
 
-    def test_int4_palette_mode_is_gated_until_cann_representation_is_confirmed(self) -> None:
+    def test_unknown_quantization_mode_is_rejected(self) -> None:
         cfg = OmegaConf.create(
             {
                 "export": {
@@ -820,7 +839,7 @@ class Flux2CannQuantizationTests(unittest.TestCase):
             }
         )
 
-        with self.assertRaisesRegex(NotImplementedError, "target CANN toolchain"):
+        with self.assertRaisesRegex(ValueError, "Unsupported quantization mode"):
             quantize_onnx(
                 cfg,
                 Path("model.onnx"),
