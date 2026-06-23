@@ -1,6 +1,6 @@
 kind: s3od
 name: s3od-dis
-pretrained_model_name_or_path: okupyn/s3od-dis
+pretrained_model_name_or_path: .hf_models/s3od.pt
 onnx_filename: s3od_dis.onnx
 quantized_onnx_filename: s3od_dis.int8.onnx
 output_name: s3od_dis

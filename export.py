@@ -27,4 +27,10 @@ def build_model_spec(cfg: DictConfig, device: torch.device) -> CannModelSpec:
 )
 def main(cfg: DictConfig) -> Path:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    return run_export_pipeline(cfg, cfg.export.output_root, build_model_spec(cfg, device))
+    return run_export_pipeline(
+        cfg, Path(str(cfg.export.output_root)), build_model_spec(cfg, device)
+    )
+
+
+if __name__ == "__main__":
+    main()
