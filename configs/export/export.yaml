@@ -1,7 +1,7 @@
 # @package _global_
 
 defaults:
-  - models: flux2
+  - models: s3od
   - _self_
 
 environment:
@@ -9,7 +9,7 @@ environment:
   hf_hub_enable_hf_transfer: "1"
 
 export:
-  output_root: ${models.output_root}
+  output_root: outputs/export
   onnx_filename: ${models.onnx_filename}
   quantized_onnx_filename: ${models.quantized_onnx_filename}
   manifest_filename: export_manifest.json

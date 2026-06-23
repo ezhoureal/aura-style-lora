@@ -5,7 +5,6 @@ revision: null
 variant: null
 local_files_only: true
 checkpoint_dir: outputs/ablation/local_edit_lora/flux2_klein_base/checkpoint-002000
-output_root: outputs/export/flux2-klein-base
 onnx_filename: transformer_denoiser.onnx
 quantized_onnx_filename: transformer_denoiser.int8.onnx
 output_name: transformer_denoiser

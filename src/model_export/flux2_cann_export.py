@@ -9,7 +9,7 @@ from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from omegaconf import DictConfig
 from torch import Tensor, nn
 
-from export.cann_export import CannModelSpec, relative_path
+from model_export.cann_export import CannModelSpec, relative_path
 
 from lora.local_edit_common import (
     dtype_from_precision,
