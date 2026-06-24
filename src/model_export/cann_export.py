@@ -401,7 +401,7 @@ def dopt_calibration_config_path(cfg: DictConfig, output_dir: Path) -> Path:
                 "device: USE_CPU",
                 "preprocess_parameter:",
                 "{",
-                "    input_type: BIN",
+                "    input_type: BINARY",
                 "}",
                 "",
             ]

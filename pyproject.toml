@@ -3,7 +3,7 @@ name = "lora"
 version = "0.1.0"
 description = "Tools for preparing and training a style transfer LoRA on image generation models."
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.10,<3.11"
 dependencies = [
     "accelerate>=0.31.0",
     "datasets>=3.0.0",
@@ -28,7 +28,7 @@ dependencies = [
     "requests>=2.34.2",
     "socksio>=1.0.0",
     "onnx>=1.21.0",
-    "onnxruntime>=1.26.0",
+    "onnxruntime>=1.20.0,<1.26.0",
     "onnxscript>=0.7.0",
 ]
 
@@ -63,7 +63,7 @@ line-length = 100
 venvPath = "."
 venv = ".venv"
 extraPaths = ["src"]
-pythonVersion = "3.12"
+pythonVersion = "3.10"
 include = [
     "src",
     "scripts"
