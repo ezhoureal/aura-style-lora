@@ -4,6 +4,7 @@ import json
 import os
 import shlex
 import shutil
+import struct
 import subprocess
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -22,7 +23,7 @@ from lora.local_edit_common import REPO_ROOT, none_if_null, resolve_repo_path
 SUPPORTED_QUANTIZATION_MODES = {"none", "int8_dynamic", "int8_dopt"}
 SUPPORTED_CANN_TARGETS = {"om", "omc", "tiny", "ispnn", "security"}
 SANITIZER_EXTERNAL_DATA_MARKER = "cann_omg_sanitized"
-SANITIZER_VERSION = "7"
+SANITIZER_VERSION = "8"
 MAX_DUPLICATED_INITIALIZER_BYTES = 1024
 
 InputShapes = Mapping[str, Sequence[int]]
@@ -364,6 +365,13 @@ def sanitize_onnx_for_omg(onnx_path: Path, *, force: bool = False) -> None:
             if len(attributes) != len(node.attribute):
                 del node.attribute[:]
                 node.attribute.extend(attributes)
+        if node.op_type == "Resize":
+            attributes = [
+                attribute for attribute in node.attribute if attribute.name != "antialias"
+            ]
+            if len(attributes) != len(node.attribute):
+                del node.attribute[:]
+                node.attribute.extend(attributes)
         if node.op_type != "Reshape":
             continue
         attributes = [attribute for attribute in node.attribute if attribute.name != "allowzero"]
@@ -389,20 +397,47 @@ def sanitize_onnx_for_omg(onnx_path: Path, *, force: bool = False) -> None:
     )
 
 
-def dopt_calibration_config_path(cfg: DictConfig, output_dir: Path) -> Path:
+def write_dopt_calibration_data(spec: CannModelSpec, output_dir: Path) -> list[Path]:
+    paths: list[Path] = []
+    for input_name, tensor in zip(spec.input_names, spec.inputs, strict=True):
+        shape = list(tensor.shape)
+        if not 1 <= len(shape) <= 4:
+            raise ValueError(f"dopt calibration input {input_name!r} must have rank 1 to 4")
+        shape.extend([1] * (4 - len(shape)))
+        path = output_dir / f"dopt_int8_{input_name}.bin"
+        values = tensor.detach().to(device="cpu", dtype=torch.float32).contiguous()
+        path.write_bytes(struct.pack("<5i", 510, *shape) + values.numpy().tobytes())
+        paths.append(path)
+    return paths
+
+
+def dopt_calibration_config_path(
+    cfg: DictConfig, output_dir: Path, model: InputShapeProvider
+) -> Path:
     configured = none_if_null(cfg.export.quantization.get("calibration_config"))
     if configured is not None:
         return resolve_repo_path(configured)
+    data_paths = (
+        write_dopt_calibration_data(model, output_dir) if isinstance(model, CannModelSpec) else []
+    )
+    preprocess_parameters: list[str] = []
+    for data_path in data_paths:
+        preprocess_parameters.extend(
+            [
+                "preprocess_parameter:",
+                "{",
+                "    input_type: BINARY",
+                f"    input_file_path: '{data_path.resolve()}'",
+                "}",
+            ]
+        )
     config_path = output_dir / "dopt_int8_calibration.prototxt"
     config_path.write_text(
         "\n".join(
             [
                 "strategy: 'Quant_INT8-8'",
                 "device: USE_CPU",
-                "preprocess_parameter:",
-                "{",
-                "    input_type: BINARY",
-                "}",
+                *preprocess_parameters,
                 "",
             ]
         ),
@@ -449,7 +484,7 @@ def dopt_command(
         "--model",
         str(onnx_path),
         "--cal_conf",
-        str(dopt_calibration_config_path(cfg, output_dir)),
+        str(dopt_calibration_config_path(cfg, output_dir, model)),
         "--output",
         str(quantized_path),
         "--input_shape",
@@ -508,37 +543,31 @@ def cann_target(cfg: DictConfig) -> str:
     return target
 
 
-def optional_omg_flag(cfg: DictConfig, key: str) -> list[str]:
-    value = none_if_null(cfg.export.cann.get(key))
-    if value is None:
-        return []
-    return [f"--{key}={value}"]
+def repo_relative_path(path: Path) -> Path:
+    return path.relative_to(REPO_ROOT) if path.is_relative_to(REPO_ROOT) else path
 
 
 def omg_command(
     cfg: DictConfig, onnx_path: Path, model: InputShapeProvider, output_dir: Path
 ) -> list[str]:
     cann_cfg = cfg.export.cann
-    output_base = output_dir / str(cann_cfg.output_name)
-    model_arg = (
-        onnx_path.relative_to(REPO_ROOT) if onnx_path.is_relative_to(REPO_ROOT) else onnx_path
-    )
-    output_arg = (
-        output_base.relative_to(REPO_ROOT) if output_base.is_relative_to(REPO_ROOT) else output_base
-    )
-    return [
+
+    command = [
         str(cann_cfg.omg_path),
         "--framework=5",
-        f"--model={model_arg}",
-        f"--output={output_arg}",
+        f"--model={repo_relative_path(onnx_path)}",
+        f"--output={repo_relative_path(output_dir / str(cann_cfg.output_name))}",
         f"--target={cann_target(cfg)}",
         f"--platform={cann_cfg.platform}",
         f"--input_shape={input_shape_argument(model)}",
-        *optional_omg_flag(cfg, "input_format"),
-        *optional_omg_flag(cfg, "weight_data_type"),
-        *optional_omg_flag(cfg, "input_type"),
-        *optional_omg_flag(cfg, "output_type"),
     ]
+
+    for key in ("input_format", "weight_data_type", "input_type", "output_type"):
+        value = none_if_null(cann_cfg.get(key))
+        if value is not None:
+            command.append(f"--{key}={value}")
+
+    return command
 
 
 def om_output_path(cfg: DictConfig, output_dir: Path) -> Path:
